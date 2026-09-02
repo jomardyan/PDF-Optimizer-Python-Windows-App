@@ -1,8 +1,8 @@
-"""Strictly lossless PDF optimization.
+"""Content-aware PDF optimization with a strictly lossless default.
 
-The optimizer deliberately limits itself to PDF container and lossless stream
-changes.  In particular, it never rasterizes pages, resamples images, or
-re-encodes JPEG/JPEG2000 image data.
+Minimum compression changes only PDF structure and lossless streams. Medium
+and Strong automatically target large raster images in image-heavy or mixed
+documents while leaving text/vector-only documents on the lossless path.
 """
 
 from __future__ import annotations
@@ -17,6 +17,15 @@ from pathlib import Path
 from typing import Protocol, TypeAlias
 
 import pikepdf
+
+from .smart_images import (
+    CompressionLevel,
+    DocumentType,
+    analyze_document,
+    coerce_compression_level,
+    document_type_label,
+    optimize_raster_images,
+)
 
 PathLike: TypeAlias = str | os.PathLike[str]
 
@@ -54,23 +63,27 @@ ProgressCallback: TypeAlias = Callable[[OptimizationStage], None]
 
 @dataclass(frozen=True, slots=True)
 class OptimizationOptions:
-    """Safe lossless optimizer settings.
+    """PDF optimizer settings.
 
-    All options remain lossless.  ``recompress_flate`` recompresses only Flate
-    streams; image codecs such as JPEG and JPEG2000 are left untouched.
-    ``generate_object_streams`` packs eligible non-stream objects more densely.
+    Minimum is strictly lossless. Medium and Strong permit content-aware JPEG
+    re-encoding/downscaling for large raster images, but text, fonts, vectors,
+    links, forms, and document structure remain untouched.
     """
 
     suffix: str = "_optimized"
     recompress_flate: bool = True
     generate_object_streams: bool = True
     linearize: bool = False
+    compression_level: CompressionLevel | str = CompressionLevel.MINIMUM
 
     def __post_init__(self) -> None:
-        if not self.suffix:
-            raise ValueError("The output filename suffix cannot be empty.")
         if any(character in self.suffix for character in ("/", "\\", "\0")):
             raise ValueError("The output filename suffix must not contain a path separator.")
+        object.__setattr__(
+            self,
+            "compression_level",
+            coerce_compression_level(self.compression_level),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +100,9 @@ class OptimizationResult:
     page_count: int
     duration: float
     message: str
+    document_type: DocumentType = DocumentType.TEXT_VECTOR
+    images_optimized: int = 0
+    compression_level: CompressionLevel = CompressionLevel.MINIMUM
 
     @property
     def original_size(self) -> int:
@@ -163,8 +179,6 @@ def _absolute_path(path: PathLike) -> Path:
 
 
 def _validate_suffix(suffix: str) -> None:
-    if not suffix:
-        raise ValueError("The output filename suffix cannot be empty.")
     if any(character in suffix for character in ("/", "\\", "\0")):
         raise ValueError("The output filename suffix must not contain a path separator.")
 
@@ -208,8 +222,8 @@ def _reserve_output_path(source: Path, directory: Path, suffix: str) -> Path:
     while True:
         candidate = next_available_output_path(source, directory, suffix)
         if candidate.resolve(strict=False) == source.resolve(strict=False):
-            # This should be impossible with a non-empty suffix, but retain the
-            # invariant even on unusual filesystems.
+            # Retain this invariant even with an empty suffix or on unusual
+            # filesystems.
             raise OutputWriteError("Refusing to overwrite the original PDF.")
         try:
             descriptor = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -479,7 +493,7 @@ def optimize_pdf(
     cancel_event: CancellationEvent | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> OptimizationResult:
-    """Optimize one PDF without changing visible quality or the source file.
+    """Optimize one PDF according to its content and selected strength.
 
     Work is written to a temporary PDF, reopened and checked, and only then
     atomically moved to an exclusively reserved output path.  If the optimized
@@ -487,9 +501,10 @@ def optimize_pdf(
     is an exact byte-for-byte copy of the original.
 
     Signed documents are returned with ``SIGNED_SKIPPED`` because rewriting a
-    signed PDF would invalidate its cryptographic signature.  Cancellation is
-    also a normal result; malformed/encrypted input and I/O failures raise the
-    typed exceptions defined in this module.
+    Minimum is strictly lossless. Medium and Strong re-encode only qualifying
+    raster images in image-heavy/mixed PDFs, leaving text/vector-only PDFs on
+    the lossless path. Signed documents are skipped because any rewrite would
+    invalidate their cryptographic signature.
     """
 
     started_at = time.perf_counter()
@@ -527,6 +542,10 @@ def optimize_pdf(
         _raise_if_cancelled(cancel_event)
         invariants = _capture_invariants(pdf)
         page_count = invariants.page_count
+        profile = analyze_document(
+            pdf,
+            lambda: _raise_if_cancelled(cancel_event),
+        )
         _raise_if_cancelled(cancel_event)
 
         if _has_digital_signature(pdf):
@@ -546,6 +565,8 @@ def optimize_pdf(
                 page_count=page_count,
                 duration=time.perf_counter() - started_at,
                 message=str(error),
+                document_type=profile.document_type,
+                compression_level=selected_options.compression_level,
             )
 
         _raise_if_cancelled(cancel_event)
@@ -565,6 +586,14 @@ def optimize_pdf(
         _emit(progress_callback, OptimizationStage.OPTIMIZING)
         _raise_if_cancelled(cancel_event)
         temporary_path = _temporary_pdf_path(directory)
+
+        image_stats = optimize_raster_images(
+            pdf,
+            profile,
+            selected_options.compression_level,
+            lambda: _raise_if_cancelled(cancel_event),
+        )
+        _raise_if_cancelled(cancel_event)
 
         object_stream_mode = (
             pikepdf.ObjectStreamMode.generate
@@ -630,17 +659,29 @@ def optimize_pdf(
             status = OptimizationStatus.ALREADY_OPTIMAL
             output_size = input_size
             saved_bytes = 0
+            final_images_optimized = 0
             message = (
-                "Already optimal—no smaller lossless version was found; "
+                "Already optimal—no smaller version was found at the selected level; "
                 "an exact copy was saved."
             )
         else:
             status = OptimizationStatus.OPTIMIZED
             output_size = candidate_size
             saved_bytes = input_size - output_size
-            message = (
-                f"Saved {saved_bytes:,} bytes with strict lossless optimization."
-            )
+            final_images_optimized = image_stats.images_reencoded
+            content_label = document_type_label(profile.document_type)
+            if final_images_optimized:
+                message = (
+                    f"Detected {content_label.lower()} content and optimized "
+                    f"{final_images_optimized} raster image"
+                    f"{'s' if final_images_optimized != 1 else ''}; "
+                    f"saved {saved_bytes:,} bytes."
+                )
+            else:
+                message = (
+                    f"Detected {content_label.lower()} content; saved "
+                    f"{saved_bytes:,} bytes with structural compression."
+                )
 
         _raise_if_cancelled(cancel_event)
         _emit(progress_callback, OptimizationStage.FINALIZING)
@@ -670,6 +711,9 @@ def optimize_pdf(
             page_count=page_count,
             duration=time.perf_counter() - started_at,
             message=message,
+            document_type=profile.document_type,
+            images_optimized=final_images_optimized,
+            compression_level=selected_options.compression_level,
         )
         _emit(progress_callback, OptimizationStage.COMPLETE)
         return result
