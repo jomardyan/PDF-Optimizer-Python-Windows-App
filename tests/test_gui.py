@@ -81,6 +81,50 @@ def test_gui_runs_pdf_and_folder_background_batches(tmp_path: Path) -> None:
             pass
 
 
+def test_queue_polish_and_standard_actions(tmp_path: Path) -> None:
+    source = tmp_path / "menu-actions.pdf"
+    _create_reducible_pdf(source)
+    app = _make_hidden_app()
+
+    try:
+        app._set_more_menu_states()
+        assert app.more_menu.entrycget("Optimize queue", "state") == "disabled"
+        assert app.drop_zone.winfo_manager() == "grid"
+        assert app.file_list._parent_frame.winfo_manager() == ""
+        assert app.empty_state.winfo_manager() == "grid"
+        assert app.clear_button.winfo_manager() == ""
+        app._apply_responsive_header(960)
+        assert app.header_subtitle.cget("text") == "Smart optimization for PDFs, scans, and folders."
+        app._apply_responsive_header(1180)
+        assert app.header_subtitle.cget("text").startswith("Automatically adapt")
+
+        app._add_paths([source])
+        app._set_more_menu_states()
+
+        assert app.drop_zone.winfo_manager() == ""
+        assert app.file_list._parent_frame.winfo_manager() == "grid"
+        assert app.empty_state.winfo_manager() == ""
+        assert app.clear_button.winfo_manager() == "grid"
+        assert app.queue_count.cget("text") == "1 item"
+        assert app.more_menu.entrycget("Open selected location", "state") == "normal"
+        assert app.more_menu.entrycget("Optimize queue", "state") == "normal"
+
+        app._copy_selected_path()
+        assert app.clipboard_get() == str(source.resolve())
+
+        app._clear_files()
+        assert app.drop_zone.winfo_manager() == "grid"
+        assert app.file_list._parent_frame.winfo_manager() == ""
+        assert app.empty_state.winfo_manager() == "grid"
+        assert app.clear_button.winfo_manager() == ""
+        assert app.queue_count.cget("text") == "0 items"
+    finally:
+        try:
+            app.destroy()
+        except TclError:
+            pass
+
+
 def test_native_drag_drop_failure_falls_back_to_picker() -> None:
     if not gui._HAS_DND_PACKAGE:
         pytest.skip("TkinterDnD2 is not installed")

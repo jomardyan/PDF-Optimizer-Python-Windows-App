@@ -9,7 +9,7 @@ import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from tkinter import TclError, filedialog, messagebox
+from tkinter import Menu, TclError, filedialog, messagebox
 from typing import Any
 
 import customtkinter as ctk
@@ -142,9 +142,9 @@ class FileRow(ctk.CTkFrame):
             width=42,
             height=46,
             corner_radius=9,
-            fg_color=COLORS["blue_soft"],
+            fg_color=COLORS["green_soft"] if kind == "folder" else COLORS["blue_soft"],
             text="DIR" if kind == "folder" else "PDF",
-            text_color=COLORS["blue"],
+            text_color=COLORS["green"] if kind == "folder" else COLORS["blue"],
             font=ctk.CTkFont(FONT_FAMILY, 11, "bold"),
         )
         self.icon.grid(row=0, column=0, rowspan=2, padx=(14, 12), pady=14)
@@ -170,7 +170,7 @@ class FileRow(ctk.CTkFrame):
 
         self.status_label = ctk.CTkLabel(
             self,
-            width=105,
+            width=112,
             height=28,
             corner_radius=14,
             text="Ready",
@@ -333,9 +333,13 @@ class PDFOptimizerApp(_BaseWindow):
         ] = []
         self.batch_errors = 0
         self.batch_skipped = 0
+        self._header_compact: bool | None = None
 
         self._build_layout()
+        self._build_menus()
         self._bind_shortcuts()
+        self.bind("<Configure>", self._on_window_configure, add="+")
+        self.after_idle(self._apply_responsive_header)
         self._enable_drag_and_drop()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(80, self._drain_events)
@@ -471,20 +475,22 @@ class PDFOptimizerApp(_BaseWindow):
         header.grid(row=0, column=0, sticky="ew", pady=(0, 18))
         header.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(
+        self.header_title = ctk.CTkLabel(
             header,
             text="Compress without compromise",
             anchor="w",
             text_color=COLORS["text"],
             font=ctk.CTkFont(FONT_FAMILY, 27, "bold"),
-        ).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(
+        )
+        self.header_title.grid(row=0, column=0, sticky="w")
+        self.header_subtitle = ctk.CTkLabel(
             header,
             text="Automatically adapt to text PDFs, scans, images, and full folders.",
             anchor="w",
             text_color=COLORS["muted"],
             font=ctk.CTkFont(FONT_FAMILY, 12),
-        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        )
+        self.header_subtitle.grid(row=1, column=0, sticky="w", pady=(2, 0))
 
         self.header_add_folder_button = ctk.CTkButton(
             header,
@@ -514,6 +520,22 @@ class PDFOptimizerApp(_BaseWindow):
             command=self._choose_files,
         )
         self.header_add_button.grid(row=0, column=2, rowspan=2)
+
+        self.more_button = ctk.CTkButton(
+            header,
+            width=42,
+            height=40,
+            corner_radius=10,
+            text="•••",
+            fg_color="transparent",
+            hover_color=COLORS["surface_alt"],
+            border_width=1,
+            border_color=COLORS["border"],
+            text_color=COLORS["muted"],
+            font=ctk.CTkFont(FONT_FAMILY, 13, "bold"),
+            command=self._show_more_menu,
+        )
+        self.more_button.grid(row=0, column=3, rowspan=2, padx=(8, 0))
 
     def _build_drop_zone(self) -> None:
         self.drop_zone = ctk.CTkFrame(
@@ -573,20 +595,31 @@ class PDFOptimizerApp(_BaseWindow):
 
         queue_header = ctk.CTkFrame(card, fg_color="transparent", height=44)
         queue_header.grid(row=0, column=0, sticky="ew", padx=16, pady=(8, 0))
-        queue_header.grid_columnconfigure(0, weight=1)
+        queue_header.grid_columnconfigure(2, weight=1)
         self.queue_title = ctk.CTkLabel(
             queue_header,
-            text="Items  ·  0",
+            text="Queue",
             anchor="w",
             text_color=COLORS["text"],
             font=ctk.CTkFont(FONT_FAMILY, 13, "bold"),
         )
         self.queue_title.grid(row=0, column=0, sticky="w")
+        self.queue_count = ctk.CTkLabel(
+            queue_header,
+            width=54,
+            height=24,
+            corner_radius=12,
+            text="0 items",
+            fg_color=COLORS["surface_alt"],
+            text_color=COLORS["muted"],
+            font=ctk.CTkFont(FONT_FAMILY, 9, "bold"),
+        )
+        self.queue_count.grid(row=0, column=1, sticky="w", padx=(9, 0))
         self.clear_button = ctk.CTkButton(
             queue_header,
-            width=70,
+            width=76,
             height=29,
-            text="Clear all",
+            text="Clear queue",
             fg_color="transparent",
             hover_color=COLORS["surface_alt"],
             text_color=COLORS["muted"],
@@ -594,7 +627,8 @@ class PDFOptimizerApp(_BaseWindow):
             state="disabled",
             command=self._clear_files,
         )
-        self.clear_button.grid(row=0, column=1, sticky="e")
+        self.clear_button.grid(row=0, column=3, sticky="e")
+        self.clear_button.grid_remove()
 
         self.file_list = ctk.CTkScrollableFrame(
             card,
@@ -604,26 +638,28 @@ class PDFOptimizerApp(_BaseWindow):
         )
         self.file_list.grid(row=1, column=0, sticky="nsew", padx=(10, 4), pady=(2, 10))
         self.file_list.grid_columnconfigure(0, weight=1)
+        self.file_list.grid_remove()
 
+        self.empty_state = ctk.CTkFrame(card, fg_color="transparent")
+        self.empty_state.grid(row=1, column=0, sticky="nsew", padx=10, pady=(2, 10))
         self.empty_label = ctk.CTkLabel(
-            self.file_list,
-            text="Your PDF and folder queue will appear here",
+            self.empty_state,
+            text="No items yet — add PDFs or a folder above",
             text_color=COLORS["subtle"],
             font=ctk.CTkFont(FONT_FAMILY, 12),
         )
-        self.empty_label.grid(row=0, column=0, sticky="nsew", pady=32)
+        self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
 
     def _build_output_options(self) -> None:
-        settings = ctk.CTkFrame(
+        self.settings_card = ctk.CTkFrame(
             self.main,
-            height=132,
             corner_radius=14,
             fg_color=COLORS["surface"],
             border_width=1,
             border_color=COLORS["border"],
         )
+        settings = self.settings_card
         settings.grid(row=3, column=0, sticky="ew", pady=(0, 14))
-        settings.grid_propagate(False)
         settings.grid_columnconfigure(1, weight=1)
 
         compression_label = ctk.CTkFrame(settings, fg_color="transparent")
@@ -647,9 +683,10 @@ class PDFOptimizerApp(_BaseWindow):
         self.compression_choice = ctk.StringVar(value="Medium")
         self.compression_switch = ctk.CTkSegmentedButton(
             settings,
-            width=278,
+            width=300,
             height=34,
             corner_radius=9,
+            border_width=0,
             values=["Minimum", "Medium", "Strong"],
             variable=self.compression_choice,
             selected_color=COLORS["blue"],
@@ -658,6 +695,7 @@ class PDFOptimizerApp(_BaseWindow):
             unselected_hover_color=COLORS["blue_soft"],
             text_color=COLORS["text"],
             font=ctk.CTkFont(FONT_FAMILY, 10, "bold"),
+            dynamic_resizing=False,
             command=self._compression_changed,
         )
         self.compression_switch.grid(row=0, column=2, sticky="e", padx=16, pady=(12, 7))
@@ -666,7 +704,7 @@ class PDFOptimizerApp(_BaseWindow):
         separator.grid(row=1, column=0, columnspan=3, sticky="ew", padx=16)
 
         output_label = ctk.CTkFrame(settings, fg_color="transparent")
-        output_label.grid(row=2, column=0, sticky="w", padx=16, pady=(7, 10))
+        output_label.grid(row=2, column=0, sticky="w", padx=16, pady=(8, 13))
         ctk.CTkLabel(
             output_label,
             text="Output location",
@@ -686,9 +724,10 @@ class PDFOptimizerApp(_BaseWindow):
         self.output_choice = ctk.StringVar(value="Beside originals")
         self.output_switch = ctk.CTkSegmentedButton(
             settings,
-            width=278,
+            width=300,
             height=34,
             corner_radius=9,
+            border_width=0,
             values=["Beside originals", "Choose folder"],
             variable=self.output_choice,
             selected_color=COLORS["blue"],
@@ -697,17 +736,26 @@ class PDFOptimizerApp(_BaseWindow):
             unselected_hover_color=COLORS["blue_soft"],
             text_color=COLORS["text"],
             font=ctk.CTkFont(FONT_FAMILY, 10, "bold"),
+            dynamic_resizing=False,
             command=self._output_mode_changed,
         )
-        self.output_switch.grid(row=2, column=2, sticky="e", padx=16, pady=(7, 10))
+        self.output_switch.grid(row=2, column=2, sticky="e", padx=16, pady=(8, 13))
 
     def _build_action_bar(self) -> None:
-        action = ctk.CTkFrame(self.main, height=58, fg_color="transparent")
+        action = ctk.CTkFrame(
+            self.main,
+            height=78,
+            corner_radius=14,
+            fg_color=COLORS["surface"],
+            border_width=1,
+            border_color=COLORS["border"],
+        )
         action.grid(row=4, column=0, sticky="ew")
+        action.grid_propagate(False)
         action.grid_columnconfigure(0, weight=1)
 
         status = ctk.CTkFrame(action, fg_color="transparent")
-        status.grid(row=0, column=0, sticky="w")
+        status.grid(row=0, column=0, sticky="ew", padx=(18, 14), pady=13)
         self.status_title = ctk.CTkLabel(
             status,
             text="Ready to optimize",
@@ -734,11 +782,12 @@ class PDFOptimizerApp(_BaseWindow):
         )
         self.progress.pack(fill="x")
         self.progress.set(0)
+        self.progress.pack_forget()
 
         self.cancel_button = ctk.CTkButton(
             action,
             width=92,
-            height=42,
+            height=44,
             corner_radius=10,
             text="Cancel",
             fg_color="transparent",
@@ -750,22 +799,140 @@ class PDFOptimizerApp(_BaseWindow):
             state="disabled",
             command=self._cancel_batch,
         )
-        self.cancel_button.grid(row=0, column=1, padx=(18, 10))
+        self.cancel_button.grid(row=0, column=1, padx=(0, 10), pady=16)
+        self.cancel_button.grid_remove()
 
         self.optimize_button = ctk.CTkButton(
             action,
-            width=164,
-            height=42,
+            width=176,
+            height=44,
             corner_radius=10,
             text="Optimize",
-            fg_color=COLORS["blue"],
+            fg_color=COLORS["surface_alt"],
             hover_color=COLORS["blue_hover"],
             text_color="#FFFFFF",
+            text_color_disabled=COLORS["subtle"],
             font=ctk.CTkFont(FONT_FAMILY, 12, "bold"),
             state="disabled",
             command=self._start_batch,
         )
-        self.optimize_button.grid(row=0, column=2)
+        self.optimize_button.grid(row=0, column=2, padx=(0, 14), pady=16)
+
+    def _build_menus(self) -> None:
+        self.more_menu = Menu(self, tearoff=False)
+        self.more_menu.add_command(
+            label="Add PDF files…", accelerator="Ctrl+O", command=self._choose_files
+        )
+        self.more_menu.add_command(
+            label="Add a folder…", accelerator="Ctrl+Shift+O", command=self._choose_folder
+        )
+        self.more_menu.add_separator()
+        self.more_menu.add_command(
+            label="Open selected location", command=self._open_selected_location
+        )
+        self.more_menu.add_command(label="Copy selected path", command=self._copy_selected_path)
+        self.more_menu.add_command(
+            label="Remove selected", accelerator="Delete", command=self._remove_selected
+        )
+        self.more_menu.add_command(label="Clear queue", command=self._clear_files)
+        self.more_menu.add_separator()
+        self.more_menu.add_command(
+            label="Optimize queue", accelerator="Ctrl+Enter", command=self._start_batch
+        )
+        self.more_menu.add_command(label="Cancel optimization", accelerator="Esc", command=self._cancel_batch)
+        self.more_menu.add_separator()
+        self.more_menu.add_command(
+            label="Keyboard shortcuts", accelerator="F1", command=self._show_shortcuts
+        )
+        self.more_menu.add_command(label="About PDF Optimizer", command=self._show_about)
+
+    def _set_more_menu_states(self) -> None:
+        can_edit = not self.is_running
+        has_items = bool(self.paths)
+        has_selection = self.selected_path in self.rows
+        for label in ("Add PDF files…", "Add a folder…"):
+            self.more_menu.entryconfigure(label, state="normal" if can_edit else "disabled")
+        for label in ("Open selected location", "Copy selected path"):
+            self.more_menu.entryconfigure(label, state="normal" if has_selection else "disabled")
+        self.more_menu.entryconfigure(
+            "Remove selected", state="normal" if can_edit and has_selection else "disabled"
+        )
+        self.more_menu.entryconfigure(
+            "Clear queue", state="normal" if can_edit and has_items else "disabled"
+        )
+        self.more_menu.entryconfigure(
+            "Optimize queue", state="normal" if can_edit and has_items else "disabled"
+        )
+        self.more_menu.entryconfigure(
+            "Cancel optimization", state="normal" if self.is_running else "disabled"
+        )
+
+    def _show_more_menu(self) -> None:
+        self._set_more_menu_states()
+        self.update_idletasks()
+        x = self.more_button.winfo_rootx() + self.more_button.winfo_width()
+        y = self.more_button.winfo_rooty() + self.more_button.winfo_height() + 3
+        try:
+            self.more_menu.tk_popup(x, y)
+        finally:
+            self.more_menu.grab_release()
+
+    def _open_selected_location(self) -> None:
+        if self.selected_path not in self.rows:
+            return
+        try:
+            _open_folder(self.selected_path)
+        except OSError as exc:
+            messagebox.showerror("Could not open location", str(exc), parent=self)
+
+    def _copy_selected_path(self) -> None:
+        if self.selected_path not in self.rows:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(str(self.selected_path))
+        self.status_detail.configure(text="Selected source path copied to the clipboard")
+
+    def _show_shortcuts(self) -> None:
+        messagebox.showinfo(
+            "Keyboard shortcuts",
+            "Ctrl+O        Add PDF files\n"
+            "Ctrl+Shift+O  Add a folder\n"
+            "Ctrl+Enter    Optimize the queue\n"
+            "Delete        Remove the selected item\n"
+            "Esc           Cancel optimization\n"
+            "F1            Show this help",
+            parent=self,
+        )
+
+    def _show_about(self) -> None:
+        messagebox.showinfo(
+            "About PDF Optimizer",
+            "PDF Optimizer\n\nSmart local compression for PDFs and complete folder clones.\n"
+            "Your source files remain untouched.",
+            parent=self,
+        )
+
+    def _on_window_configure(self, event: Any) -> None:
+        if event.widget is self:
+            self._apply_responsive_header()
+
+    def _apply_responsive_header(self, logical_width: float | None = None) -> None:
+        if logical_width is None:
+            logical_width = self.winfo_width() / self._get_window_scaling()
+        compact = logical_width < 1080
+        if compact == self._header_compact:
+            return
+        self._header_compact = compact
+        self.header_title.configure(
+            font=ctk.CTkFont(FONT_FAMILY, 21 if compact else 27, "bold")
+        )
+        self.header_subtitle.configure(
+            text=(
+                "Smart optimization for PDFs, scans, and folders."
+                if compact
+                else "Automatically adapt to text PDFs, scans, images, and full folders."
+            )
+        )
 
     def _bind_shortcuts(self) -> None:
         self.bind_all("<Control-o>", lambda _event: self._choose_files())
@@ -774,6 +941,7 @@ class PDFOptimizerApp(_BaseWindow):
         self.bind_all("<Control-Return>", lambda _event: self._start_batch())
         self.bind_all("<Delete>", lambda _event: self._remove_selected())
         self.bind_all("<Escape>", lambda _event: self._cancel_batch())
+        self.bind_all("<F1>", lambda _event: self._show_shortcuts())
 
     def _enable_drag_and_drop(self) -> None:
         if not self._dnd_available:
@@ -894,6 +1062,7 @@ class PDFOptimizerApp(_BaseWindow):
                 detail += f"  •  Merged {merged} nested item{'s' if merged != 1 else ''}"
             self.status_detail.configure(text=detail)
             self.progress.set(0)
+            self.progress.pack_forget()
         if rejected:
             self.status_detail.configure(
                 text=f"Ignored {rejected} item{'s' if rejected != 1 else ''} that were not PDFs or folders"
@@ -901,17 +1070,33 @@ class PDFOptimizerApp(_BaseWindow):
 
     def _refresh_file_rows(self) -> None:
         if self.paths:
-            self.empty_label.grid_remove()
+            self.empty_state.grid_remove()
+            self.file_list.grid()
+            self.drop_zone.grid_remove()
         else:
-            self.empty_label.grid()
+            self.file_list.grid_remove()
+            self.empty_state.grid()
+            self.drop_zone.grid()
 
         for index, path in enumerate(self.paths):
             self.rows[path].grid(row=index, column=0, sticky="ew", padx=2, pady=(2, 6))
 
         count = len(self.paths)
-        self.queue_title.configure(text=f"Items  ·  {count}")
+        self.queue_count.configure(
+            text=f"{count} item{'s' if count != 1 else ''}",
+            fg_color=COLORS["blue_soft"] if count else COLORS["surface_alt"],
+            text_color=COLORS["blue"] if count else COLORS["muted"],
+        )
         self.clear_button.configure(state="normal" if count and not self.is_running else "disabled")
-        self.optimize_button.configure(state="normal" if count and not self.is_running else "disabled")
+        if count:
+            self.clear_button.grid()
+        else:
+            self.clear_button.grid_remove()
+        can_optimize = bool(count and not self.is_running)
+        self.optimize_button.configure(
+            state="normal" if can_optimize else "disabled",
+            fg_color=COLORS["blue"] if can_optimize else COLORS["surface_alt"],
+        )
         self.optimize_button.configure(
             text=f"Optimize {count} item{'s' if count != 1 else ''}"
             if count
@@ -946,6 +1131,7 @@ class PDFOptimizerApp(_BaseWindow):
             self.status_title.configure(text="Ready to optimize")
             self.status_detail.configure(text="Add PDF files or a folder to begin")
             self.progress.set(0)
+            self.progress.pack_forget()
 
     def _clear_files(self) -> None:
         if self.is_running:
@@ -961,6 +1147,7 @@ class PDFOptimizerApp(_BaseWindow):
         self.status_title.configure(text="Ready to optimize")
         self.status_detail.configure(text="Add PDF files or a folder to begin")
         self.progress.set(0)
+        self.progress.pack_forget()
 
     def _output_mode_changed(self, value: str) -> None:
         if value == "Choose folder":
@@ -1026,6 +1213,7 @@ class PDFOptimizerApp(_BaseWindow):
         options = engine.OptimizationOptions(compression_level=level)
         self.status_title.configure(text="Preparing smart optimization…")
         self.status_detail.configure(text=f"Item 1 of {len(self.paths)}  •  {level.value.title()} compression")
+        self.progress.pack(fill="x")
         self.progress.configure(mode="indeterminate")
         self.progress.start()
 
@@ -1260,8 +1448,16 @@ class PDFOptimizerApp(_BaseWindow):
         self.clear_button.configure(state="disabled" if running or not self.paths else "normal")
         self.output_switch.configure(state=normal_state)
         self.compression_switch.configure(state=normal_state)
-        self.optimize_button.configure(state="disabled" if running or not self.paths else "normal")
+        can_optimize = bool(self.paths and not running)
+        self.optimize_button.configure(
+            state="normal" if can_optimize else "disabled",
+            fg_color=COLORS["blue"] if can_optimize else COLORS["surface_alt"],
+        )
         self.cancel_button.configure(state="normal" if running else "disabled", text="Cancel")
+        if running:
+            self.cancel_button.grid()
+        else:
+            self.cancel_button.grid_remove()
 
     def _cancel_batch(self) -> None:
         if not self.is_running or self.cancel_event.is_set():
