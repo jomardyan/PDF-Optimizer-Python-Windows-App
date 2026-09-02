@@ -1,4 +1,4 @@
-"""Modern batch desktop interface for the lossless PDF optimizer."""
+"""Modern batch desktop interface for smart PDF and folder optimization."""
 
 from __future__ import annotations
 
@@ -14,7 +14,9 @@ from typing import Any
 
 import customtkinter as ctk
 
+from . import folder_optimizer as folders
 from . import optimizer as engine
+from .smart_images import CompressionLevel, document_type_label
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -76,6 +78,14 @@ def _shorten(value: str, maximum: int = 52) -> str:
     return f"{value[:left]}…{value[-right:]}"
 
 
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
 def _open_folder(path: Path) -> None:
     folder = path if path.is_dir() else path.parent
     if sys.platform == "win32":
@@ -98,7 +108,7 @@ else:
 
 
 class FileRow(ctk.CTkFrame):
-    """A single queued PDF and its current/result state."""
+    """A queued PDF or folder clone and its current/result state."""
 
     def __init__(
         self,
@@ -106,6 +116,8 @@ class FileRow(ctk.CTkFrame):
         path: Path,
         on_remove: Callable[[Path], None],
         on_select: Callable[[Path], None],
+        kind: str = "pdf",
+        pdf_count: int = 0,
     ) -> None:
         super().__init__(
             master,
@@ -116,6 +128,8 @@ class FileRow(ctk.CTkFrame):
             border_color=COLORS["border"],
         )
         self.path = path
+        self.kind = kind
+        self.pdf_count = pdf_count
         self.output_path: Path | None = None
         self._locked = False
         self._on_remove = on_remove
@@ -129,7 +143,7 @@ class FileRow(ctk.CTkFrame):
             height=46,
             corner_radius=9,
             fg_color=COLORS["blue_soft"],
-            text="PDF",
+            text="DIR" if kind == "folder" else "PDF",
             text_color=COLORS["blue"],
             font=ctk.CTkFont(FONT_FAMILY, 11, "bold"),
         )
@@ -144,11 +158,7 @@ class FileRow(ctk.CTkFrame):
         )
         self.name_label.grid(row=0, column=1, sticky="sew", pady=(13, 1))
 
-        try:
-            file_size = path.stat().st_size
-            detail = f"{format_bytes(file_size)}  •  {_shorten(str(path.parent), 58)}"
-        except OSError:
-            detail = _shorten(str(path.parent), 58)
+        detail = self._ready_detail()
         self.detail_label = ctk.CTkLabel(
             self,
             text=detail,
@@ -193,6 +203,15 @@ class FileRow(ctk.CTkFrame):
             border_color=COLORS["blue"] if selected else COLORS["border"],
         )
 
+    def _ready_detail(self) -> str:
+        if self.kind == "folder":
+            pdf_text = f"{self.pdf_count} PDF{'s' if self.pdf_count != 1 else ''}"
+            return f"{pdf_text}  •  Full structure and all other files will be cloned"
+        try:
+            return f"{format_bytes(self.path.stat().st_size)}  •  {_shorten(str(self.path.parent), 58)}"
+        except OSError:
+            return _shorten(str(self.path.parent), 58)
+
     def set_locked(self, locked: bool) -> None:
         self._locked = locked
         if self.output_path and not locked:
@@ -218,22 +237,36 @@ class FileRow(ctk.CTkFrame):
 
     def reset(self) -> None:
         self.output_path = None
-        try:
-            detail = f"{format_bytes(self.path.stat().st_size)}  •  {_shorten(str(self.path.parent), 58)}"
-        except OSError:
-            detail = _shorten(str(self.path.parent), 58)
-        self.set_status("Ready", "blue", detail)
+        self.set_status("Ready", "blue", self._ready_detail())
         self.action_button.configure(text="Remove", command=lambda: self._on_remove(self.path))
 
-    def show_result(self, result: engine.OptimizationResult) -> None:
+    def show_result(
+        self,
+        result: engine.OptimizationResult | folders.FolderOptimizationResult,
+    ) -> None:
         status_value = getattr(result.status, "value", str(result.status)).lower()
         output_path = getattr(result, "output_path", None)
         self.output_path = Path(output_path) if output_path else None
 
-        if status_value == "optimized":
+        if isinstance(result, folders.FolderOptimizationResult) and self.output_path:
+            detail = (
+                f"{result.pdf_total} PDF{'s' if result.pdf_total != 1 else ''}"
+                f"  •  {result.other_files_copied} other file"
+                f"{'s' if result.other_files_copied != 1 else ''}"
+                f"  •  Saved {format_bytes(result.saved_bytes)}"
+            )
+            self.set_status("Folder cloned", "green", detail)
+        elif status_value == "optimized":
+            content = document_type_label(result.document_type)
+            image_note = (
+                f"  •  {result.images_optimized} image"
+                f"{'s' if result.images_optimized != 1 else ''} optimized"
+                if result.images_optimized
+                else ""
+            )
             detail = (
                 f"{format_bytes(result.input_size)} → {format_bytes(result.output_size)}"
-                f"  •  {result.saved_percent:.1f}% smaller"
+                f"  •  {result.saved_percent:.1f}% smaller  •  {content}{image_note}"
             )
             self.set_status("Optimized", "green", detail)
         elif "signed" in status_value:
@@ -241,7 +274,8 @@ class FileRow(ctk.CTkFrame):
         elif "cancel" in status_value:
             self.set_status("Canceled", "amber", result.message)
         else:
-            detail = f"{format_bytes(result.input_size)}  •  No smaller lossless version found"
+            content = document_type_label(result.document_type)
+            detail = f"{format_bytes(result.input_size)}  •  Already efficient  •  {content}"
             self.set_status("Already optimal", "amber", detail)
 
         if self.output_path:
@@ -285,6 +319,8 @@ class PDFOptimizerApp(_BaseWindow):
 
         self.paths: list[Path] = []
         self.rows: dict[Path, FileRow] = {}
+        self.item_kinds: dict[Path, str] = {}
+        self.folder_pdf_counts: dict[Path, int] = {}
         self.selected_path: Path | None = None
         self.selected_output_dir: Path | None = None
         self.is_running = False
@@ -292,7 +328,9 @@ class PDFOptimizerApp(_BaseWindow):
         self.cancel_event = threading.Event()
         self.events: queue.Queue[tuple[Any, ...]] = queue.Queue()
         self.worker: threading.Thread | None = None
-        self.batch_results: list[engine.OptimizationResult] = []
+        self.batch_results: list[
+            engine.OptimizationResult | folders.FolderOptimizationResult
+        ] = []
         self.batch_errors = 0
         self.batch_skipped = 0
 
@@ -365,14 +403,14 @@ class PDFOptimizerApp(_BaseWindow):
         guarantee.grid(row=3, column=0, sticky="ew", padx=22)
         ctk.CTkLabel(
             guarantee,
-            text="TRUE LOSSLESS",
+            text="SMART AUTO MODE",
             anchor="w",
             text_color="#72E1B3",
             font=ctk.CTkFont(FONT_FAMILY, 10, "bold"),
         ).pack(fill="x", padx=17, pady=(15, 3))
         ctk.CTkLabel(
             guarantee,
-            text="Images, fonts, and page content\nare never re-encoded.",
+            text="Text and vectors stay crisp. Large\nimages follow your chosen level.",
             anchor="w",
             justify="left",
             text_color=COLORS["sidebar_text"],
@@ -383,8 +421,8 @@ class PDFOptimizerApp(_BaseWindow):
         benefits.grid(row=4, column=0, sticky="ew", padx=28, pady=(27, 0))
         for text in (
             "Original files stay untouched",
+            "Folder structure is preserved",
             "Processing stays on this PC",
-            "Every output is validated",
         ):
             item = ctk.CTkFrame(benefits, fg_color="transparent")
             item.pack(fill="x", pady=5)
@@ -405,7 +443,7 @@ class PDFOptimizerApp(_BaseWindow):
 
         note = ctk.CTkLabel(
             sidebar,
-            text="Lossless savings depend on how the\noriginal PDF was created.",
+            text="Minimum is fully lossless. Medium is\nthe recommended everyday setting.",
             justify="left",
             anchor="w",
             text_color="#8FA5BF",
@@ -442,15 +480,31 @@ class PDFOptimizerApp(_BaseWindow):
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             header,
-            text="Losslessly optimize one PDF or a whole batch.",
+            text="Automatically adapt to text PDFs, scans, images, and full folders.",
             anchor="w",
             text_color=COLORS["muted"],
             font=ctk.CTkFont(FONT_FAMILY, 12),
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        self.header_add_button = ctk.CTkButton(
+        self.header_add_folder_button = ctk.CTkButton(
             header,
             width=112,
+            height=40,
+            corner_radius=10,
+            text="+  Add folder",
+            fg_color="transparent",
+            hover_color=COLORS["blue_soft"],
+            border_width=1,
+            border_color=COLORS["blue"],
+            text_color=COLORS["blue"],
+            font=ctk.CTkFont(FONT_FAMILY, 12, "bold"),
+            command=self._choose_folder,
+        )
+        self.header_add_folder_button.grid(row=0, column=1, rowspan=2, padx=(20, 8))
+
+        self.header_add_button = ctk.CTkButton(
+            header,
+            width=108,
             height=40,
             corner_radius=10,
             text="+  Add PDFs",
@@ -459,7 +513,7 @@ class PDFOptimizerApp(_BaseWindow):
             font=ctk.CTkFont(FONT_FAMILY, 12, "bold"),
             command=self._choose_files,
         )
-        self.header_add_button.grid(row=0, column=1, rowspan=2, padx=(20, 0))
+        self.header_add_button.grid(row=0, column=2, rowspan=2)
 
     def _build_drop_zone(self) -> None:
         self.drop_zone = ctk.CTkFrame(
@@ -476,13 +530,13 @@ class PDFOptimizerApp(_BaseWindow):
 
         ctk.CTkLabel(
             self.drop_zone,
-            text="Drop PDF files here",
+            text="Drop PDF files or a folder here",
             text_color=COLORS["text"],
             font=ctk.CTkFont(FONT_FAMILY, 15, "bold"),
         ).grid(row=0, column=0, pady=(23, 2))
-        drop_hint = "Drag several files at once, or browse from your computer"
+        drop_hint = "A folder is cloned completely; its PDFs are optimized in place in the clone"
         if not self._dnd_available:
-            drop_hint = "Browse and select several PDF files at once"
+            drop_hint = "Use Add PDFs or Add folder to choose what to optimize"
         ctk.CTkLabel(
             self.drop_zone,
             text=drop_hint,
@@ -522,7 +576,7 @@ class PDFOptimizerApp(_BaseWindow):
         queue_header.grid_columnconfigure(0, weight=1)
         self.queue_title = ctk.CTkLabel(
             queue_header,
-            text="Files  ·  0",
+            text="Items  ·  0",
             anchor="w",
             text_color=COLORS["text"],
             font=ctk.CTkFont(FONT_FAMILY, 13, "bold"),
@@ -553,37 +607,76 @@ class PDFOptimizerApp(_BaseWindow):
 
         self.empty_label = ctk.CTkLabel(
             self.file_list,
-            text="Your PDF queue will appear here",
+            text="Your PDF and folder queue will appear here",
             text_color=COLORS["subtle"],
             font=ctk.CTkFont(FONT_FAMILY, 12),
         )
         self.empty_label.grid(row=0, column=0, sticky="nsew", pady=32)
 
     def _build_output_options(self) -> None:
-        output = ctk.CTkFrame(
+        settings = ctk.CTkFrame(
             self.main,
-            height=80,
+            height=132,
             corner_radius=14,
             fg_color=COLORS["surface"],
             border_width=1,
             border_color=COLORS["border"],
         )
-        output.grid(row=3, column=0, sticky="ew", pady=(0, 14))
-        output.grid_propagate(False)
-        output.grid_columnconfigure(1, weight=1)
+        settings.grid(row=3, column=0, sticky="ew", pady=(0, 14))
+        settings.grid_propagate(False)
+        settings.grid_columnconfigure(1, weight=1)
 
-        label_block = ctk.CTkFrame(output, fg_color="transparent")
-        label_block.grid(row=0, column=0, sticky="w", padx=16, pady=12)
+        compression_label = ctk.CTkFrame(settings, fg_color="transparent")
+        compression_label.grid(row=0, column=0, sticky="w", padx=16, pady=(10, 7))
         ctk.CTkLabel(
-            label_block,
+            compression_label,
+            text="Compression level",
+            anchor="w",
+            text_color=COLORS["text"],
+            font=ctk.CTkFont(FONT_FAMILY, 12, "bold"),
+        ).pack(fill="x")
+        self.compression_detail = ctk.CTkLabel(
+            compression_label,
+            text="Recommended • high-quality images; text stays crisp",
+            anchor="w",
+            text_color=COLORS["muted"],
+            font=ctk.CTkFont(FONT_FAMILY, 10),
+        )
+        self.compression_detail.pack(fill="x", pady=(1, 0))
+
+        self.compression_choice = ctk.StringVar(value="Medium")
+        self.compression_switch = ctk.CTkSegmentedButton(
+            settings,
+            width=278,
+            height=34,
+            corner_radius=9,
+            values=["Minimum", "Medium", "Strong"],
+            variable=self.compression_choice,
+            selected_color=COLORS["blue"],
+            selected_hover_color=COLORS["blue_hover"],
+            unselected_color=COLORS["surface_alt"],
+            unselected_hover_color=COLORS["blue_soft"],
+            text_color=COLORS["text"],
+            font=ctk.CTkFont(FONT_FAMILY, 10, "bold"),
+            command=self._compression_changed,
+        )
+        self.compression_switch.grid(row=0, column=2, sticky="e", padx=16, pady=(12, 7))
+
+        separator = ctk.CTkFrame(settings, height=1, fg_color=COLORS["border"])
+        separator.grid(row=1, column=0, columnspan=3, sticky="ew", padx=16)
+
+        output_label = ctk.CTkFrame(settings, fg_color="transparent")
+        output_label.grid(row=2, column=0, sticky="w", padx=16, pady=(7, 10))
+        ctk.CTkLabel(
+            output_label,
             text="Output location",
             anchor="w",
             text_color=COLORS["text"],
             font=ctk.CTkFont(FONT_FAMILY, 12, "bold"),
         ).pack(fill="x")
         self.output_detail = ctk.CTkLabel(
-            label_block,
-            text="New files use the suffix _optimized",
+            output_label,
+            text="PDFs use _optimized; folders become complete _optimized clones",
             anchor="w",
             text_color=COLORS["muted"],
             font=ctk.CTkFont(FONT_FAMILY, 10),
@@ -592,9 +685,9 @@ class PDFOptimizerApp(_BaseWindow):
 
         self.output_choice = ctk.StringVar(value="Beside originals")
         self.output_switch = ctk.CTkSegmentedButton(
-            output,
+            settings,
             width=278,
-            height=36,
+            height=34,
             corner_radius=9,
             values=["Beside originals", "Choose folder"],
             variable=self.output_choice,
@@ -606,7 +699,7 @@ class PDFOptimizerApp(_BaseWindow):
             font=ctk.CTkFont(FONT_FAMILY, 10, "bold"),
             command=self._output_mode_changed,
         )
-        self.output_switch.grid(row=0, column=2, sticky="e", padx=16, pady=20)
+        self.output_switch.grid(row=2, column=2, sticky="e", padx=16, pady=(7, 10))
 
     def _build_action_bar(self) -> None:
         action = ctk.CTkFrame(self.main, height=58, fg_color="transparent")
@@ -625,7 +718,7 @@ class PDFOptimizerApp(_BaseWindow):
         self.status_title.pack(fill="x")
         self.status_detail = ctk.CTkLabel(
             status,
-            text="Add one or more PDF files to begin",
+            text="Add PDF files or a folder to begin",
             anchor="w",
             text_color=COLORS["muted"],
             font=ctk.CTkFont(FONT_FAMILY, 10),
@@ -664,7 +757,7 @@ class PDFOptimizerApp(_BaseWindow):
             width=164,
             height=42,
             corner_radius=10,
-            text="Optimize PDFs",
+            text="Optimize",
             fg_color=COLORS["blue"],
             hover_color=COLORS["blue_hover"],
             text_color="#FFFFFF",
@@ -677,6 +770,7 @@ class PDFOptimizerApp(_BaseWindow):
     def _bind_shortcuts(self) -> None:
         self.bind_all("<Control-o>", lambda _event: self._choose_files())
         self.bind_all("<Control-O>", lambda _event: self._choose_files())
+        self.bind_all("<Control-Shift-O>", lambda _event: self._choose_folder())
         self.bind_all("<Control-Return>", lambda _event: self._start_batch())
         self.bind_all("<Delete>", lambda _event: self._remove_selected())
         self.bind_all("<Escape>", lambda _event: self._cancel_batch())
@@ -711,6 +805,23 @@ class PDFOptimizerApp(_BaseWindow):
         )
         self._add_paths(Path(value) for value in selected)
 
+    def _choose_folder(self) -> None:
+        if self.is_running:
+            return
+        selected = filedialog.askdirectory(parent=self, title="Choose a folder to clone")
+        if selected:
+            self._add_paths([Path(selected)])
+
+    @staticmethod
+    def _count_pdfs(folder: Path) -> int:
+        count = 0
+        try:
+            for _root, _directories, files in os.walk(folder, followlinks=False):
+                count += sum(name.lower().endswith(".pdf") for name in files)
+        except OSError:
+            return count
+        return count
+
     def _add_paths(self, paths: Any) -> None:
         if self.is_running:
             return
@@ -718,6 +829,7 @@ class PDFOptimizerApp(_BaseWindow):
         existing = {os.path.normcase(str(path.resolve())) for path in self.paths}
         added = 0
         rejected = 0
+        merged = 0
         for raw_path in paths:
             path = Path(raw_path).expanduser()
             try:
@@ -726,25 +838,66 @@ class PDFOptimizerApp(_BaseWindow):
                 rejected += 1
                 continue
             key = os.path.normcase(str(resolved))
-            if not resolved.is_file() or resolved.suffix.lower() != ".pdf":
+            is_pdf = resolved.is_file() and resolved.suffix.lower() == ".pdf"
+            is_folder = resolved.is_dir()
+            if not is_pdf and not is_folder:
                 rejected += 1
                 continue
             if key in existing:
                 continue
+
+            # An already queued parent folder owns every PDF/nested folder
+            # below it, so adding the child separately would duplicate work.
+            if any(
+                self.item_kinds.get(existing_path) == "folder"
+                and _path_is_within(resolved, existing_path)
+                for existing_path in self.paths
+            ):
+                continue
+
+            # Adding a parent folder merges any previously queued children.
+            if is_folder:
+                nested_items = [
+                    existing_path
+                    for existing_path in self.paths
+                    if _path_is_within(existing_path, resolved)
+                ]
+                for nested_item in nested_items:
+                    self._remove_file(nested_item)
+                    merged += 1
+                existing = {os.path.normcase(str(path.resolve())) for path in self.paths}
+
             existing.add(key)
             self.paths.append(resolved)
-            row = FileRow(self.file_list, resolved, self._remove_file, self._select_file)
+            kind = "folder" if is_folder else "pdf"
+            pdf_count = self._count_pdfs(resolved) if is_folder else 0
+            self.item_kinds[resolved] = kind
+            if is_folder:
+                self.folder_pdf_counts[resolved] = pdf_count
+            row = FileRow(
+                self.file_list,
+                resolved,
+                self._remove_file,
+                self._select_file,
+                kind=kind,
+                pdf_count=pdf_count,
+            )
             self.rows[resolved] = row
             added += 1
 
         if added:
             self._refresh_file_rows()
             self._select_file(self.paths[-1])
-            self.status_title.configure(text=f"{len(self.paths)} PDF{'s' if len(self.paths) != 1 else ''} ready")
-            self.status_detail.configure(text="Lossless optimization will never alter the originals")
+            self.status_title.configure(text=f"{len(self.paths)} item{'s' if len(self.paths) != 1 else ''} ready")
+            detail = "Sources stay untouched; folder clones preserve every file and subfolder"
+            if merged:
+                detail += f"  •  Merged {merged} nested item{'s' if merged != 1 else ''}"
+            self.status_detail.configure(text=detail)
             self.progress.set(0)
         if rejected:
-            self.status_detail.configure(text=f"Ignored {rejected} item{'s' if rejected != 1 else ''} that were not PDF files")
+            self.status_detail.configure(
+                text=f"Ignored {rejected} item{'s' if rejected != 1 else ''} that were not PDFs or folders"
+            )
 
     def _refresh_file_rows(self) -> None:
         if self.paths:
@@ -756,10 +909,14 @@ class PDFOptimizerApp(_BaseWindow):
             self.rows[path].grid(row=index, column=0, sticky="ew", padx=2, pady=(2, 6))
 
         count = len(self.paths)
-        self.queue_title.configure(text=f"Files  ·  {count}")
+        self.queue_title.configure(text=f"Items  ·  {count}")
         self.clear_button.configure(state="normal" if count and not self.is_running else "disabled")
         self.optimize_button.configure(state="normal" if count and not self.is_running else "disabled")
-        self.optimize_button.configure(text=f"Optimize {count} PDF{'s' if count != 1 else ''}" if count else "Optimize PDFs")
+        self.optimize_button.configure(
+            text=f"Optimize {count} item{'s' if count != 1 else ''}"
+            if count
+            else "Optimize"
+        )
 
     def _select_file(self, path: Path) -> None:
         if path not in self.rows:
@@ -778,6 +935,8 @@ class PDFOptimizerApp(_BaseWindow):
         row = self.rows.pop(path)
         row.destroy()
         self.paths.remove(path)
+        self.item_kinds.pop(path, None)
+        self.folder_pdf_counts.pop(path, None)
         if self.selected_path == path:
             self.selected_path = self.paths[-1] if self.paths else None
         self._refresh_file_rows()
@@ -785,7 +944,7 @@ class PDFOptimizerApp(_BaseWindow):
             self._select_file(self.selected_path)
         if not self.paths:
             self.status_title.configure(text="Ready to optimize")
-            self.status_detail.configure(text="Add one or more PDF files to begin")
+            self.status_detail.configure(text="Add PDF files or a folder to begin")
             self.progress.set(0)
 
     def _clear_files(self) -> None:
@@ -795,10 +954,12 @@ class PDFOptimizerApp(_BaseWindow):
             row.destroy()
         self.paths.clear()
         self.rows.clear()
+        self.item_kinds.clear()
+        self.folder_pdf_counts.clear()
         self.selected_path = None
         self._refresh_file_rows()
         self.status_title.configure(text="Ready to optimize")
-        self.status_detail.configure(text="Add one or more PDF files to begin")
+        self.status_detail.configure(text="Add PDF files or a folder to begin")
         self.progress.set(0)
 
     def _output_mode_changed(self, value: str) -> None:
@@ -811,7 +972,17 @@ class PDFOptimizerApp(_BaseWindow):
             self.selected_output_dir = Path(chosen).resolve()
             self.output_detail.configure(text=_shorten(str(self.selected_output_dir), 70))
         else:
-            self.output_detail.configure(text="New files use the suffix _optimized")
+            self.output_detail.configure(
+                text="PDFs use _optimized; folders become complete _optimized clones"
+            )
+
+    def _compression_changed(self, value: str) -> None:
+        descriptions = {
+            "Minimum": "Fully lossless • structural compression only",
+            "Medium": "Recommended • high-quality images; text stays crisp",
+            "Strong": "Smallest scans • image softness may be visible when zoomed",
+        }
+        self.compression_detail.configure(text=descriptions[value])
 
     def _start_batch(self) -> None:
         if self.is_running or not self.paths:
@@ -819,6 +990,24 @@ class PDFOptimizerApp(_BaseWindow):
         if self.output_choice.get() == "Choose folder" and not self.selected_output_dir:
             self._output_mode_changed("Choose folder")
             if not self.selected_output_dir:
+                return
+        if self.selected_output_dir and self.output_choice.get() == "Choose folder":
+            unsafe_source = next(
+                (
+                    path
+                    for path in self.paths
+                    if self.item_kinds.get(path) == "folder"
+                    and _path_is_within(self.selected_output_dir, path)
+                ),
+                None,
+            )
+            if unsafe_source:
+                messagebox.showerror(
+                    "Choose a different output folder",
+                    "A folder clone cannot be created inside its source tree. "
+                    f"Choose a location outside:\n{unsafe_source}",
+                    parent=self,
+                )
                 return
 
         self.is_running = True
@@ -833,8 +1022,10 @@ class PDFOptimizerApp(_BaseWindow):
             row.set_locked(True)
 
         self._set_controls_running(True)
-        self.status_title.configure(text="Preparing lossless optimization…")
-        self.status_detail.configure(text=f"File 1 of {len(self.paths)}")
+        level = CompressionLevel(self.compression_choice.get().lower())
+        options = engine.OptimizationOptions(compression_level=level)
+        self.status_title.configure(text="Preparing smart optimization…")
+        self.status_detail.configure(text=f"Item 1 of {len(self.paths)}  •  {level.value.title()} compression")
         self.progress.configure(mode="indeterminate")
         self.progress.start()
 
@@ -842,31 +1033,54 @@ class PDFOptimizerApp(_BaseWindow):
         output_dir = self.selected_output_dir if self.output_choice.get() == "Choose folder" else None
         self.worker = threading.Thread(
             target=self._run_batch,
-            args=(paths_snapshot, output_dir),
+            args=(paths_snapshot, dict(self.item_kinds), output_dir, options),
             name="pdf-optimizer-worker",
             daemon=True,
         )
         self.worker.start()
 
-    def _run_batch(self, paths: list[Path], output_dir: Path | None) -> None:
+    def _run_batch(
+        self,
+        paths: list[Path],
+        item_kinds: dict[Path, str],
+        output_dir: Path | None,
+        options: engine.OptimizationOptions,
+    ) -> None:
         total = len(paths)
         for index, path in enumerate(paths, start=1):
             if self.cancel_event.is_set():
                 self.events.put(("canceled_remaining", paths[index - 1 :]))
                 break
 
-            self.events.put(("file_start", path, index, total))
+            item_kind = item_kinds.get(path, "pdf")
+            self.events.put(("file_start", path, index, total, item_kind))
 
             def report_stage(stage: engine.OptimizationStage, current_path: Path = path) -> None:
                 self.events.put(("stage", current_path, stage))
 
+            def report_folder_progress(
+                progress: folders.FolderProgress,
+                current_path: Path = path,
+            ) -> None:
+                self.events.put(("folder_progress", current_path, progress))
+
             try:
-                result = engine.optimize_pdf(
-                    path,
-                    output_dir=output_dir,
-                    cancel_event=self.cancel_event,
-                    progress_callback=report_stage,
-                )
+                if item_kind == "folder":
+                    result = folders.clone_and_optimize_folder(
+                        path,
+                        output_parent=output_dir,
+                        options=options,
+                        cancel_event=self.cancel_event,
+                        progress_callback=report_folder_progress,
+                    )
+                else:
+                    result = engine.optimize_pdf(
+                        path,
+                        output_dir=output_dir,
+                        options=options,
+                        cancel_event=self.cancel_event,
+                        progress_callback=report_stage,
+                    )
                 self.events.put(("result", path, result))
             except Exception as exc:  # noqa: BLE001 - isolate each batch item
                 self.events.put(("error", path, exc))
@@ -883,13 +1097,17 @@ class PDFOptimizerApp(_BaseWindow):
                 event = self.events.get_nowait()
                 kind = event[0]
                 if kind == "file_start":
-                    _, path, index, total = event
-                    self.status_title.configure(text=f"Optimizing {_shorten(path.name, 42)}")
-                    self.status_detail.configure(text=f"File {index} of {total}  •  Checking document")
-                    self.rows[path].set_status("Checking", "blue")
+                    _, path, index, total, item_kind = event
+                    action = "Cloning" if item_kind == "folder" else "Optimizing"
+                    self.status_title.configure(text=f"{action} {_shorten(path.name, 42)}")
+                    self.status_detail.configure(text=f"Item {index} of {total}  •  Checking content")
+                    self.rows[path].set_status("Scanning" if item_kind == "folder" else "Checking", "blue")
                 elif kind == "stage":
                     _, path, stage = event
                     self._show_stage(path, stage)
+                elif kind == "folder_progress":
+                    _, path, progress = event
+                    self._show_folder_progress(path, progress)
                 elif kind == "result":
                     _, path, result = event
                     self.batch_results.append(result)
@@ -926,6 +1144,39 @@ class PDFOptimizerApp(_BaseWindow):
                 except TclError:
                     pass
 
+    def _show_folder_progress(
+        self,
+        path: Path,
+        progress: folders.FolderProgress,
+    ) -> None:
+        if path not in self.rows:
+            return
+        stage = progress.stage
+        current = _shorten(str(progress.current_path), 52) if progress.current_path else ""
+        count = (
+            f"{min(progress.completed_files + 1, progress.total_files)} of {progress.total_files}"
+            if progress.total_files
+            else ""
+        )
+        if stage is folders.FolderStage.SCANNING:
+            label, detail, tone = "Scanning", "Reading the complete folder structure", "blue"
+        elif stage is folders.FolderStage.COPYING:
+            label = "Cloning"
+            detail = f"Copying {current}  •  {count}" if count else f"Copying {current}"
+            tone = "blue"
+        elif stage is folders.FolderStage.OPTIMIZING_PDF:
+            label = "Optimizing PDFs"
+            detail = f"{current}  •  {count}" if count else current
+            tone = "blue"
+        elif stage is folders.FolderStage.FINALIZING:
+            label, detail, tone = "Finalizing", "Publishing the completed clone safely", "blue"
+        elif stage is folders.FolderStage.CANCELLED:
+            label, detail, tone = "Canceled", "No partial clone was kept", "amber"
+        else:
+            return
+        self.rows[path].set_status(label, tone)
+        self.status_detail.configure(text=detail)
+
     def _show_stage(self, path: Path, stage: Any) -> None:
         if path not in self.rows:
             return
@@ -960,10 +1211,19 @@ class PDFOptimizerApp(_BaseWindow):
         input_total = sum(max(0, int(result.input_size)) for result in successful_results)
         percent = (saved / input_total * 100) if input_total else 0.0
         optimized = sum(
-            1
+            result.optimized_count
+            if isinstance(result, folders.FolderOptimizationResult)
+            else 1
             for result in self.batch_results
             if getattr(result.status, "value", str(result.status)).lower() == "optimized"
         )
+        folder_clones = sum(
+            1
+            for result in successful_results
+            if isinstance(result, folders.FolderOptimizationResult)
+        )
+        completed_items = len(successful_results)
+        images_optimized = sum(result.images_optimized for result in successful_results)
 
         if was_canceled:
             self.status_title.configure(text="Optimization canceled safely")
@@ -971,11 +1231,19 @@ class PDFOptimizerApp(_BaseWindow):
             self.progress.set(0)
         elif self.batch_errors:
             self.status_title.configure(text=f"Finished with {self.batch_errors} error{'s' if self.batch_errors != 1 else ''}")
-            self.status_detail.configure(text=f"{optimized} optimized  •  {self.batch_skipped} skipped  •  Saved {format_bytes(saved)}")
+            self.status_detail.configure(
+                text=f"{completed_items} completed  •  {self.batch_skipped} skipped  •  Saved {format_bytes(saved)}"
+            )
             self.progress.set(1)
         else:
             self.status_title.configure(text="Optimization complete")
-            detail = f"{optimized} reduced  •  Saved {format_bytes(saved)} ({percent:.1f}%)"
+            detail = f"{completed_items} item{'s' if completed_items != 1 else ''} completed"
+            if folder_clones:
+                detail += f"  •  {folder_clones} folder{'s' if folder_clones != 1 else ''} cloned"
+            detail += f"  •  {optimized} PDF{'s' if optimized != 1 else ''} reduced"
+            if images_optimized:
+                detail += f"  •  {images_optimized} image{'s' if images_optimized != 1 else ''} optimized"
+            detail += f"  •  Saved {format_bytes(saved)} ({percent:.1f}%)"
             if self.batch_skipped:
                 detail += f"  •  {self.batch_skipped} skipped"
             self.status_detail.configure(text=detail)
@@ -987,9 +1255,11 @@ class PDFOptimizerApp(_BaseWindow):
     def _set_controls_running(self, running: bool) -> None:
         normal_state = "disabled" if running else "normal"
         self.header_add_button.configure(state=normal_state)
+        self.header_add_folder_button.configure(state=normal_state)
         self.browse_button.configure(state=normal_state)
         self.clear_button.configure(state="disabled" if running or not self.paths else "normal")
         self.output_switch.configure(state=normal_state)
+        self.compression_switch.configure(state=normal_state)
         self.optimize_button.configure(state="disabled" if running or not self.paths else "normal")
         self.cancel_button.configure(state="normal" if running else "disabled", text="Cancel")
 
@@ -999,7 +1269,7 @@ class PDFOptimizerApp(_BaseWindow):
         self.cancel_event.set()
         self.cancel_button.configure(state="disabled", text="Stopping…")
         self.status_title.configure(text="Stopping safely…")
-        self.status_detail.configure(text="The current write will finish before temporary files are removed")
+        self.status_detail.configure(text="Temporary PDF and folder-clone data will be removed safely")
 
     def _toggle_appearance(self) -> None:
         current = ctk.get_appearance_mode().lower()

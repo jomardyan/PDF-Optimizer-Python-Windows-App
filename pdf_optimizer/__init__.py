@@ -46,7 +46,7 @@ __all__ = [
     "SignedPDFError",
     "ValidationError",
     "clone_and_optimize_folder",
-    "next_available_output_path",
     "next_available_clone_path",
+    "next_available_output_path",
     "optimize_pdf",
 ]

@@ -1,30 +1,49 @@
 # PDF Optimizer
 
-PDF Optimizer is a Windows desktop app for batch-optimizing PDF files without reducing visible quality. It uses pikepdf and qpdf to rewrite the PDF structure more efficiently while leaving page content, image resolution, image codecs, fonts, and vector graphics intact.
+PDF Optimizer is a Windows desktop app for content-aware PDF compression and complete folder cloning. It automatically distinguishes text/vector documents from mixed or image-heavy scans, then applies the selected compression level while keeping source files untouched.
 
-## What “lossless” means here
+## Compression levels
 
-The optimizer uses only structural, lossless PDF transformations. It does not downsample images, convert pages to pictures, lower JPEG quality, remove pages, or intentionally alter document content. The optimized file is not byte-for-byte identical to the source because its internal object layout and compression can change, but its rendered content should remain visually unchanged.
+| Level | Automatic behavior | Quality tradeoff |
+| --- | --- | --- |
+| **Minimum** | Structural/object-stream and lossless Flate compression only | Strictly lossless; images and vectors are not re-encoded |
+| **Medium** | Keeps text/vector PDFs on the lossless path; recompresses sufficiently large images in mixed/scanned PDFs at high quality | Recommended for everyday use; differences should be difficult to notice at normal viewing size |
+| **Strong** | Uses the same content detection with stronger JPEG compression and a smaller maximum raster dimension | Produces smaller scans; softness or JPEG artifacts may be visible when zoomed |
 
-Size reduction is not guaranteed. PDFs that are already efficient—especially scanned documents dominated by JPEG images—may not become smaller without lossy image recompression. When no smaller lossless candidate is available, the app creates a byte-for-byte copy under the unique `_optimized` output name and reports **Already optimal**.
+Text, fonts, vectors, links, forms, annotations, and page structure are never rasterized. Medium and Strong only target qualifying RGB or grayscale raster images. Transparent, masked, monochrome, small, and unusual color-space images are conservatively skipped.
 
-The source PDF is never overwritten or modified. Every successfully processed file receives a separate, uniquely named output file, so existing files are preserved.
+Size reduction is not guaranteed. If a candidate is not smaller, the app discards it, creates an exact byte-for-byte copy under the output name, and reports **Already optimal**.
+
+## Folder clone mode
+
+Use **Add folder** to create a complete sibling clone named `<folder>_optimized` (or place it in a chosen output directory). The app:
+
+- Recreates every subfolder, including empty folders.
+- Copies Word, Excel, images, archives, and every other non-PDF file without changing their names or contents.
+- Optimizes each PDF into its original relative location and original filename inside the clone.
+- Copies signed, encrypted, or malformed PDFs unchanged so the cloned folder is still complete.
+- Builds the clone in a temporary directory and publishes it only after the full tree is ready; canceled work leaves no partial clone.
+
+Existing clone names are never overwritten; `_optimized_1`, `_optimized_2`, and so on are used when necessary.
 
 ## Features
 
-- Add multiple PDFs with the file picker or drag and drop.
+- Add multiple PDFs or a whole folder with the picker or drag and drop.
+- Choose Minimum, Medium, or Strong compression.
+- Automatically use a lossless text/vector path or an image-aware mixed/scan path.
+- Clone complete folder trees while preserving all non-PDF files and relative paths.
 - Optimize the batch in the background while the interface remains responsive.
 - See progress, per-file status, original and output sizes, and savings.
 - Cancel queued work safely.
 - Open each completed output's containing folder from the app.
-- Save results beside each source by default, or choose one output folder for the batch.
+- Save PDF results and cloned folders beside each source by default, or choose one output location for the batch.
 - Generate collision-safe `_optimized` output names without touching originals or overwriting existing outputs.
 
 ## Signed and encrypted PDFs
 
-Rewriting a digitally signed PDF invalidates its cryptographic signature, even if the pages still look identical. PDF Optimizer therefore detects and skips signed files instead of producing a misleading “signed” result.
+Rewriting a digitally signed PDF invalidates its cryptographic signature, even if the pages still look identical. Standalone signed PDFs are therefore skipped. In folder clone mode they are copied unchanged.
 
-Encrypted or password-protected PDFs are also skipped. The app does not ask for, store, or remove PDF passwords. Decrypt an authorized copy with an appropriate tool first, then optimize that copy if permitted.
+Encrypted or password-protected standalone PDFs are also skipped; folder clone mode copies them unchanged. The app does not ask for, store, or remove PDF passwords.
 
 ## Requirements
 
@@ -76,11 +95,12 @@ The builder bootstraps `.venv` when necessary, installs the development dependen
 dist\PDFOptimizer.exe
 ```
 
-PyInstaller packages applications for the operating system on which it runs, so create the Windows executable on Windows. The included spec file collects CustomTkinter, pikepdf, and TkinterDnD2 resources required by the standalone app.
+PyInstaller packages applications for the operating system on which it runs, so create the Windows executable on Windows. The included spec uses the platform-aware CustomTkinter and TkinterDnD2 hooks and packages pikepdf/qpdf for the standalone app.
 
 ## Notes on results
 
-- Lossless optimization is most effective on PDFs with inefficient object layout, duplicate structures, uncompressed streams, or obsolete cross-reference organization.
-- It generally cannot substantially shrink image-heavy files without changing image data and therefore visible fidelity.
+- Minimum compression is most effective on PDFs with inefficient object layout, uncompressed streams, or obsolete cross-reference organization.
+- Medium and Strong can substantially shrink image-heavy documents because those modes intentionally re-encode eligible raster images.
+- Automatic classification is conservative: unsupported or risky image formats are kept as-is.
 - “0 B saved” or **Already optimal** is a valid result, not an optimization failure.
 - Always keep important source documents and independently verify critical outputs before distribution.

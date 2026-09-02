@@ -304,13 +304,17 @@ def clone_and_optimize_folder(
                     except OSError as exc:
                         raise OutputWriteError(f"Could not inspect '{source_file}'.") from exc
 
-                    def report_pdf_stage(stage: OptimizationStage) -> None:
+                    def report_pdf_stage(
+                        stage: OptimizationStage,
+                        current_file: Path = relative_file,
+                        completed: int = completed_files,
+                    ) -> None:
                         _emit(
                             progress_callback,
                             FolderProgress(
                                 FolderStage.OPTIMIZING_PDF,
-                                relative_file,
-                                completed_files,
+                                current_file,
+                                completed,
                                 total_files,
                                 stage,
                             ),
