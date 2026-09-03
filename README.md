@@ -72,6 +72,20 @@ py -3 -m venv .venv
 
 If `py` is unavailable but `python` points to Python 3.11 or newer, replace `py -3` with `python`.
 
+## Dear PyGui alternative
+
+An optional Dear PyGui interface is included alongside the standard Tkinter app. Double-click `run_dearpygui.bat` to create its separate `.venv-dearpygui` environment and launch it; the existing `run.bat` workflow is unchanged.
+
+To install and run the alternative interface manually:
+
+```powershell
+py -3 -m venv .venv-dearpygui
+.venv-dearpygui\Scripts\python.exe -m pip install -r requirements-dearpygui.txt
+.venv-dearpygui\Scripts\python.exe app_dearpygui.py
+```
+
+Use `app_dearpygui.py --smoke-test` for a non-interactive startup check.
+
 ## Tests
 
 Install the development requirements and run pytest:

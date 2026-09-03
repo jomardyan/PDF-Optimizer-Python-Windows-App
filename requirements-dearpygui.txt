@@ -1,0 +1,4 @@
+# Runtime dependencies for the alternative Dear PyGui interface (Python 3.11+)
+dearpygui==2.3.1
+pikepdf>=10.12,<11
+Pillow>=10,<13
