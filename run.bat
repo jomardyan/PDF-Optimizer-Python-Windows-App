@@ -25,15 +25,8 @@ if not exist "requirements.txt" (
 )
 
 if not exist "%VENV_PY%" (
-    call :find_python
-    if errorlevel 1 exit /b 1
-
     echo [SETUP] Creating the local Python environment at .venv ...
-    if /i "%PY_LAUNCHER%"=="py" (
-        py -3 -m venv "%VENV_DIR%"
-    ) else (
-        python -m venv "%VENV_DIR%"
-    )
+    call :create_venv
     if errorlevel 1 (
         echo [ERROR] Python could not create .venv.
         echo         Check that the venv module is installed, then try again.
@@ -64,10 +57,20 @@ if not "%APP_EXIT%"=="0" (
 )
 exit /b %APP_EXIT%
 
+:create_venv
+call :find_python
+if errorlevel 1 exit /b 1
+if /i "%PY_LAUNCHER%"=="py" (
+    call py -3 -m venv "%VENV_DIR%"
+) else (
+    call python -m venv "%VENV_DIR%"
+)
+exit /b %ERRORLEVEL%
+
 :find_python
 where py >nul 2>&1
 if not errorlevel 1 (
-    py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+    call py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
     if not errorlevel 1 (
         set "PY_LAUNCHER=py"
         exit /b 0
@@ -76,7 +79,7 @@ if not errorlevel 1 (
 
 where python >nul 2>&1
 if not errorlevel 1 (
-    python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+    call python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
     if not errorlevel 1 (
         set "PY_LAUNCHER=python"
         exit /b 0

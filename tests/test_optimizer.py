@@ -358,3 +358,39 @@ def test_atomic_finalize_failure_cleans_up_and_preserves_source(
     assert source.read_bytes() == original
     assert not (tmp_path / "atomic_optimized.pdf").exists()
     assert not list(tmp_path.glob(".pdf_optimizer_*.pdf"))
+
+
+def test_direct_nested_signature_is_preserved(tmp_path: Path) -> None:
+    source = tmp_path / "direct-signature.pdf"
+    with pikepdf.Pdf.new() as pdf:
+        pdf.add_blank_page()
+        signature = pikepdf.Dictionary(
+            Type=pikepdf.Name.Sig, ByteRange=pikepdf.Array([0, 10, 20, 10]),
+            Contents=pikepdf.String(b"signature"),
+        )
+        field = pikepdf.Dictionary(FT=pikepdf.Name.Sig, V=signature)
+        pdf.Root["/AcroForm"] = pikepdf.Dictionary(Fields=pikepdf.Array([field]))
+        pdf.save(source)
+    result = optimize_pdf(source)
+    assert result.status is OptimizationStatus.SIGNED_SKIPPED
+    assert result.output_path is None
+
+
+def test_cancelled_result_retains_compression_selection(tmp_path: Path) -> None:
+    source = tmp_path / "cancel.pdf"
+    source.write_bytes(b"irrelevant")
+    cancel = threading.Event()
+    cancel.set()
+    result = optimize_pdf(source, options=OptimizationOptions(compression_level="strong"), cancel_event=cancel)
+    assert result.compression_level.value == "strong"
+
+
+def test_syntax_warnings_reject_candidate_and_clean_output(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "syntax.pdf"
+    _write_feature_pdf(source)
+    original = source.read_bytes()
+    monkeypatch.setattr(pikepdf.Pdf, "check_pdf_syntax", lambda *a, **k: ["damaged stream"])
+    with pytest.raises(optimizer_module.ValidationError, match="syntax validation"):
+        optimize_pdf(source)
+    assert source.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [source]

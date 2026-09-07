@@ -24,7 +24,7 @@ Use **Add folder** to create a complete sibling clone named `<folder>_optimized`
 - Copies signed, encrypted, or malformed PDFs unchanged so the cloned folder is still complete.
 - Builds the clone in a temporary directory and publishes it only after the full tree is ready; canceled work leaves no partial clone.
 
-Existing clone names are never overwritten; `_optimized_1`, `_optimized_2`, and so on are used when necessary.
+Existing clone names are never overwritten; `_optimized_1`, `_optimized_2`, and so on are used when necessary. Windows directory junctions are rejected to prevent loops or copying data outside the selected tree; select the junction's target folder directly. Symbolic links are preserved when Windows permissions allow it.
 
 ## Features
 
@@ -34,10 +34,24 @@ Existing clone names are never overwritten; `_optimized_1`, `_optimized_2`, and 
 - Clone complete folder trees while preserving all non-PDF files and relative paths.
 - Optimize the batch in the background while the interface remains responsive.
 - See progress, per-file status, original and output sizes, and savings.
+- Double-click a queue item (or use **View selected details** in the menu) to read its full path and result.
+- Use **Change…** to select another custom output folder; canceling the picker keeps the previous selection.
 - Cancel queued work safely.
 - Open each completed output's containing folder from the app.
 - Save PDF results and cloned folders beside each source by default, or choose one output location for the batch.
 - Generate collision-safe `_optimized` output names without touching originals or overwriting existing outputs.
+
+## Repeat batch workflows
+
+- **Saved preferences:** compression strength, appearance, and the custom output folder are remembered automatically. Use **Reset saved preferences** in the `•••` menu to return to defaults.
+- **Save/load queues:** use `••• → Queue` or **Ctrl+S / Ctrl+L** to save a JSON queue and reload it later. The file stores source paths, their order, and settings; it does not embed PDFs or start processing. Loading replaces the current queue after validation. Missing or unsupported sources are reported; if none are available, the current queue is kept.
+- **Retry unfinished:** after a batch with failed or canceled items, use the queue's **Retry unfinished** button. It reruns only those items with the current settings and keeps successful outputs and their displayed results. Signed and encrypted skips are not retried automatically.
+- **Optimize selected:** select a row, then choose **Optimize selected** from the `•••` menu.
+- **Export CSV:** export the latest attempt for each processed item still in the queue, including failures and cancellations. Reports contain source/output paths, compression level, sizes, savings, page count, duration, time, status, and messages. Folder byte totals refer to PDFs, excluding unchanged non-PDF files. Retrying replaces that item's record; clearing/removing queue items removes their records, so export first if you want to keep them.
+- **Reorder:** use **Alt+Up / Alt+Down**, or the Queue submenu, to change processing order.
+- **Open documents:** use **Open original** or **Open optimized copy** to inspect files in your default PDF viewer (folder items open in Explorer).
+
+Preferences are stored in `%LOCALAPPDATA%\PDFOptimizer\preferences.json` on Windows. Set `PDF_OPTIMIZER_CONFIG_DIR` to use a different configuration directory. Source documents and batch results are not automatically saved in preferences. CSV files use UTF-8 with a BOM for spreadsheet compatibility.
 
 ## Signed and encrypted PDFs
 
@@ -72,19 +86,7 @@ py -3 -m venv .venv
 
 If `py` is unavailable but `python` points to Python 3.11 or newer, replace `py -3` with `python`.
 
-## Dear PyGui alternative
-
-An optional Dear PyGui interface is included alongside the standard Tkinter app. Double-click `run_dearpygui.bat` to create its separate `.venv-dearpygui` environment and launch it; the existing `run.bat` workflow is unchanged.
-
-To install and run the alternative interface manually:
-
-```powershell
-py -3 -m venv .venv-dearpygui
-.venv-dearpygui\Scripts\python.exe -m pip install -r requirements-dearpygui.txt
-.venv-dearpygui\Scripts\python.exe app_dearpygui.py
-```
-
-Use `app_dearpygui.py --smoke-test` for a non-interactive startup check.
+Use `app.py --smoke-test` for a non-interactive startup check.
 
 ## Tests
 

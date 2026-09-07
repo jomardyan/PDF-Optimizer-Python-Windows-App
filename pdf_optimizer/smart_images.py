@@ -95,73 +95,77 @@ def _object_identity(obj: Any) -> tuple[str, int, int]:
     return ("direct", id(obj), 0)
 
 
-def _walk_resource_images(
-    resources: Any,
-    visited_resources: set[tuple[str, int, int]],
-) -> Iterator[Any]:
-    if resources is None:
-        return
-    identity = _object_identity(resources)
-    if identity in visited_resources:
-        return
-    visited_resources.add(identity)
-
-    try:
-        xobjects = resources.get("/XObject")
-    except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
-        return
-    if xobjects is None:
-        return
-
-    try:
-        values = tuple(xobjects.values())
-    except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
-        return
-    for xobject in values:
+def _walk_resources(resources: Any) -> Iterator[Any]:
+    """Walk Form resources without recursion or recycled direct-object IDs."""
+    pending = [resources]
+    visited: dict[tuple[str, int, int], Any] = {}
+    while pending:
+        current = pending.pop()
+        if current is None:
+            continue
+        identity = _object_identity(current)
+        if identity in visited:
+            continue
+        visited[identity] = current
+        yield current
         try:
-            subtype = str(xobject.get("/Subtype"))
+            xobjects = current.get("/XObject")
+            values = tuple(xobjects.values()) if xobjects is not None else ()
         except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
             continue
-        if subtype == "/Image":
-            yield xobject
-        elif subtype == "/Form":
+        for xobject in values:
             try:
-                nested_resources = xobject.get("/Resources")
+                if str(xobject.get("/Subtype")) == "/Form":
+                    # Track the indirect Form too: its Resources may be direct.
+                    identity = _object_identity(xobject)
+                    if identity not in visited:
+                        visited[identity] = xobject
+                        pending.append(xobject.get("/Resources"))
             except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
-                nested_resources = None
-            yield from _walk_resource_images(nested_resources, visited_resources)
+                continue
+
+
+def _page_resources(page: pikepdf.Page) -> Any:
+    """Resolve inheritable resources without modifying the page tree."""
+    current = page.obj
+    visited: dict[tuple[str, int, int], Any] = {}
+    while current is not None:
+        identity = _object_identity(current)
+        if identity in visited:
+            return None
+        visited[identity] = current
+        try:
+            resources = current.get("/Resources")
+            if resources is not None:
+                return resources
+            current = current.get("/Parent")
+        except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
+            return None
+    return None
 
 
 def _page_images(page: pikepdf.Page) -> tuple[Any, ...]:
-    try:
-        resources = page.obj.get("/Resources")
-    except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
-        return ()
-    return tuple(_walk_resource_images(resources, set()))
-
-
-def _resources_have_fonts(resources: Any, visited: set[tuple[str, int, int]]) -> bool:
-    if resources is None:
-        return False
-    identity = _object_identity(resources)
-    if identity in visited:
-        return False
-    visited.add(identity)
-    try:
-        fonts = resources.get("/Font")
-        if fonts is not None and len(fonts) > 0:
-            return True
-        xobjects = resources.get("/XObject")
-        if xobjects is None:
-            return False
-        forms = tuple(xobjects.values())
-    except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
-        return False
-    for xobject in forms:
+    images = []
+    for resources in _walk_resources(_page_resources(page)):
         try:
-            if str(xobject.get("/Subtype")) != "/Form":
+            xobjects = resources.get("/XObject")
+            values = tuple(xobjects.values()) if xobjects is not None else ()
+        except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
+            continue
+        for xobject in values:
+            try:
+                if str(xobject.get("/Subtype")) == "/Image":
+                    images.append(xobject)
+            except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
                 continue
-            if _resources_have_fonts(xobject.get("/Resources"), visited):
+    return tuple(images)
+
+
+def _resources_have_fonts(resources: Any) -> bool:
+    for current in _walk_resources(resources):
+        try:
+            fonts = current.get("/Font")
+            if fonts is not None and len(fonts) > 0:
                 return True
         except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
             continue
@@ -203,11 +207,7 @@ def analyze_document(
                 page_has_large_image = True
         if page_has_large_image:
             large_image_pages += 1
-        try:
-            resources = page.obj.get("/Resources")
-        except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
-            resources = None
-        if _resources_have_fonts(resources, set()):
+        if _resources_have_fonts(_page_resources(page)):
             text_resource_pages += 1
 
     page_count = len(pdf.pages)
@@ -281,6 +281,9 @@ def optimize_raster_images(
             has_mask = "/SMask" in stream or "/Mask" in stream
             is_mask = bool(stream.get("/ImageMask", False))
             has_custom_decode = "/Decode" in stream
+            color_space = str(stream.get("/ColorSpace"))
+            has_embedded_mask = int(stream.get("/SMaskInData", 0)) != 0
+            has_external_data = "/F" in stream
         except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
             skipped += 1
             continue
@@ -288,10 +291,14 @@ def optimize_raster_images(
             width <= 0
             or height <= 0
             or pixels < preset.minimum_pixels
+            or (Image.MAX_IMAGE_PIXELS is not None and pixels > Image.MAX_IMAGE_PIXELS)
             or bits != 8
             or has_mask
             or is_mask
             or has_custom_decode
+            or has_embedded_mask
+            or has_external_data
+            or color_space not in {"/DeviceRGB", "/DeviceGray"}
         ):
             skipped += 1
             continue
@@ -303,13 +310,19 @@ def optimize_raster_images(
 
         try:
             pil_image = pikepdf.PdfImage(stream).as_pil_image()
-        except (OSError, ValueError, RuntimeError, pikepdf.PdfError):
+        except (
+            OSError, ValueError, RuntimeError, Image.DecompressionBombError,
+            pikepdf.PdfError, pikepdf.UnsupportedImageTypeError,
+        ):
             skipped += 1
             continue
 
         working_image: Image.Image | None = None
         try:
             if pil_image.mode not in {"L", "RGB"}:
+                skipped += 1
+                continue
+            if pil_image.size != (width, height):
                 skipped += 1
                 continue
             longest = max(pil_image.size)
@@ -341,34 +354,37 @@ def optimize_raster_images(
                 skipped += 1
                 continue
 
-            stream.write(candidate, filter=pikepdf.Name.DCTDecode)
-            stream["/Width"] = working_image.width
-            stream["/Height"] = working_image.height
-            stream["/BitsPerComponent"] = 8
-            stream["/ColorSpace"] = (
-                pikepdf.Name.DeviceGray
-                if working_image.mode == "L"
-                else pikepdf.Name.DeviceRGB
-            )
-            for key in (
-                "/DecodeParms",
-                "/F",
-                "/FFilter",
-                "/FDecodeParms",
-                "/SMaskInData",
-            ):
-                _delete_key_if_present(stream, key)
-            changed += 1
-            bytes_before += original_size
-            bytes_after += len(candidate)
-        except (OSError, ValueError, RuntimeError, pikepdf.PdfError):
+            output_width, output_height = working_image.size
+            output_mode = working_image.mode
+        except (
+            OSError, ValueError, RuntimeError, Image.DecompressionBombError,
+            pikepdf.PdfError, pikepdf.UnsupportedImageTypeError,
+        ):
             skipped += 1
+            continue
         finally:
             try:
                 if working_image is not None and working_image is not pil_image:
                     working_image.close()
             finally:
                 pil_image.close()
+
+        if check_cancelled:
+            check_cancelled()
+        # A failure after mutation starts must abort the candidate, rather than
+        # treating a partially rewritten stream as an unchanged/skipped image.
+        stream.write(candidate, filter=pikepdf.Name.DCTDecode)
+        stream["/Width"] = output_width
+        stream["/Height"] = output_height
+        stream["/BitsPerComponent"] = 8
+        stream["/ColorSpace"] = (
+            pikepdf.Name.DeviceGray if output_mode == "L" else pikepdf.Name.DeviceRGB
+        )
+        for key in ("/DecodeParms", "/F", "/FFilter", "/FDecodeParms", "/SMaskInData"):
+            _delete_key_if_present(stream, key)
+        changed += 1
+        bytes_before += original_size
+        bytes_after += len(candidate)
 
     return ImageOptimizationStats(
         images_reencoded=changed,

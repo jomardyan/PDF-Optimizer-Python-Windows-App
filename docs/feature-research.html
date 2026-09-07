@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PDF Optimizer — Batch workflow additions</title>
+  <style>
+    :root{color-scheme:light;font-family:Segoe UI,Arial,sans-serif;color:#172438;background:#eff3f8}
+    *{box-sizing:border-box}body{margin:0;padding:36px 20px}main{max-width:920px;margin:auto;background:#fff;border:1px solid #dbe3ee;border-radius:16px;padding:42px}
+    h1{font-size:32px;letter-spacing:-.7px;line-height:1.15;margin:10px 0 18px}h2{font-size:20px;margin-top:30px}p,li,td{font-size:15px;line-height:1.65}a{color:#174da9;text-underline-offset:3px}.meta{color:#60708a;font-size:13px}.answer{background:#edf4ff;border-left:4px solid #3c76d7;padding:16px 20px;border-radius:4px}
+    table{width:100%;border-collapse:collapse;margin:18px 0}th{text-align:left;font-size:13px;color:#566985;background:#f5f7fa}td,th{padding:12px;vertical-align:top;border-bottom:1px solid #e3e9f1}td:first-child{font-weight:600;width:27%}li{margin-bottom:8px}code{font-size:13px;background:#f1f4f8;padding:2px 5px;border-radius:3px}.note{font-size:13px;color:#60708a}footer{border-top:1px solid #dbe3ee;margin-top:30px;padding-top:14px}
+    @media(max-width:600px){body{padding:12px}main{padding:22px}h1{font-size:27px}td,th{padding:8px}}
+    @media print{body{padding:0;background:white}main{max-width:none;border:0;padding:12px}h2,tr{break-inside:avoid}a{color:#174da9}}
+  </style>
+</head>
+<body><main>
+  <p class="meta">PRODUCT RESEARCH &amp; IMPLEMENTATION BRIEF · 7 SEPTEMBER 2026</p>
+  <h1>Make repeat PDF batches easier</h1>
+  <p>For the owner of PDF Optimizer. Scope: the existing Windows desktop app, local processing, preservation of original files, and practical additions to the current interface.</p>
+  <div class="answer"><strong>Decision:</strong> prioritize saved settings, targeted retries, and exportable results. Your stated preference confirms this direction. Reusable queues, queue ordering, and direct document opening complete the same workflow.</div>
+
+  <h2>Why this direction fits</h2>
+  <p>PDF24 documents remembering compression settings, while PDFsam documents saved workspaces that restore tool configuration. These provide established examples for reducing repeated setup. They do not measure demand among this app’s users. <a href="https://creator.pdf24.org/changelog/en.html">PDF24 Creator changelog</a> · <a href="https://pdfsam.org/pdfsam-basic-workspaces/">PDFsam workspaces</a></p>
+  <p>Adobe’s guided actions expose processing reports and let users stop and resume work while retaining processed outputs. For this app, retrying only failed or canceled items and exporting a CSV are implementation choices based on that broader pattern and your preference. <a href="https://helpx.adobe.com/acrobat/using/action-wizard-acrobat-pro.html">Adobe guided actions</a></p>
+
+  <h2>What was added</h2>
+  <table>
+    <thead><tr><th>Function</th><th>Behavior and where to find it</th></tr></thead>
+    <tbody>
+      <tr><td>Saved preferences</td><td>Compression strength, appearance, and output folder are remembered locally. Reset them through the <strong>•••</strong> menu.</td></tr>
+      <tr><td>Targeted retry</td><td><strong>Retry unfinished</strong> processes failed and canceled items using the current settings. Completed outputs remain available; signed or encrypted skips are excluded.</td></tr>
+      <tr><td>Export results</td><td><strong>Export CSV</strong> saves the latest attempt for each processed item still in the queue, including failures and cancellations. It includes paths, sizes, savings, status, timing, and messages.</td></tr>
+      <tr><td>Reusable queues</td><td><strong>••• → Queue</strong>, or <strong>Ctrl+S / Ctrl+L</strong>, saves and loads ordered sources and settings. Loading never starts processing.</td></tr>
+      <tr><td>Queue controls</td><td><strong>Alt+Up / Alt+Down</strong> changes order. <strong>Optimize selected</strong> runs a single queued item.</td></tr>
+      <tr><td>Inspect documents</td><td><strong>Open original</strong> and <strong>Open optimized copy</strong> use the existing default viewer. Folder items open in Explorer.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Alternatives considered</h2>
+  <p>Page tools are a reasonable later expansion: PDFsam offers merge, split, rotation, and extraction. However, pikepdf’s page-copying examples warn that document-level metadata and bookmarks do not transfer automatically. That adds preservation work beyond this batch improvement. <a href="https://pdfsam.org/documentation/">PDFsam documentation</a> · <a href="https://pikepdf.readthedocs.io/en/stable/topics/pages.html">pikepdf page assembly</a></p>
+  <p>An embedded page preview would require another renderer because pikepdf does not rasterize pages. Opening documents in the installed viewer avoids that dependency for this release. This is an engineering tradeoff, not a claim that integrated previews lack value. <a href="https://pikepdf.readthedocs.io/en/stable/index.html">pikepdf capabilities</a></p>
+
+  <h2>Limits and verification</h2>
+  <ul>
+    <li>Queue files store paths and settings, not PDFs or past results. Missing sources are reported. Invalid imports leave the current queue intact.</li>
+    <li>Reports cover the current queue’s latest attempts. Removing or clearing items removes their records; export first to retain them. Folder byte totals count PDFs only.</li>
+    <li>Preferences and exports use atomic writes. Tests check retry isolation, reporting of unsuccessful attempts, queue restoration, invalid input handling, and preference persistence.</li>
+    <li>Product documentation and the stated user preference support prioritization. No user study, comparative speed benchmark, or market-demand estimate was performed.</li>
+  </ul>
+  <footer><p class="note">Primary sources: PDF24, PDFsam, Adobe, and pikepdf. All links were consulted on 7 September 2026. Adobe’s page displays an update date of 26 February 2026; other pages are rolling documentation or changelogs. Research stopped after the main choices had primary support and the user confirmed the batch-workflow priority.</p></footer>
+</main></body></html>

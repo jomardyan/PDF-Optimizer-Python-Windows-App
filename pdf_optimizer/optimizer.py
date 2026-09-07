@@ -330,6 +330,7 @@ def _cancelled_result(
     page_count: int,
     started_at: float,
     callback: ProgressCallback | None,
+    compression_level: CompressionLevel = CompressionLevel.MINIMUM,
 ) -> OptimizationResult:
     _emit(callback, OptimizationStage.CANCELLED)
     return OptimizationResult(
@@ -343,6 +344,7 @@ def _cancelled_result(
         page_count=page_count,
         duration=time.perf_counter() - started_at,
         message="Optimization canceled; no output file was created.",
+        compression_level=compression_level,
     )
 
 
@@ -362,7 +364,9 @@ def _looks_like_signature_dictionary(value: object) -> bool:
         return False
 
 
-def _has_digital_signature(pdf: pikepdf.Pdf) -> bool:
+def _has_digital_signature(
+    pdf: pikepdf.Pdf, cancel_event: CancellationEvent | None = None,
+) -> bool:
     """Conservatively detect approval, certification, and usage signatures."""
 
     root = pdf.Root
@@ -376,10 +380,26 @@ def _has_digital_signature(pdf: pikepdf.Pdf) -> bool:
         # The full object scan below remains the authoritative fallback.
         pass
 
-    for obj in pdf.objects:
+    # Field dictionaries may be direct and nested, so pdf.objects alone is
+    # insufficient to protect every signed document.
+    pending = list(pdf.objects)
+    retained: dict[tuple[int, int] | int, object] = {}
+    while pending:
+        _raise_if_cancelled(cancel_event)
+        obj = pending.pop()
+        if not isinstance(obj, (pikepdf.Dictionary, pikepdf.Array, pikepdf.Stream)):
+            continue
+        key = obj.objgen if obj.objgen != (0, 0) else id(obj)
+        if key in retained:
+            continue
+        retained[key] = obj
         if _looks_like_signature_dictionary(obj):
             return True
         try:
+            if isinstance(obj, pikepdf.Array):
+                pending.extend(obj)
+                continue
+            pending.extend(obj.values())
             if _object_name(obj.get("/FT")) == "/Sig":
                 value = obj.get("/V")
                 if value is not None and _looks_like_signature_dictionary(value):
@@ -428,9 +448,13 @@ def _validate_candidate(
         ) as candidate:
             # qpdf performs additional syntax checks here (including stream
             # access) beyond merely opening the cross-reference table.
-            candidate.check_pdf_syntax(
+            issues = candidate.check_pdf_syntax(
                 progress=lambda _percent: _raise_if_cancelled(cancel_event)
             )
+            if issues:
+                raise ValidationError(
+                    "The optimized PDF failed syntax validation; no output was saved."
+                )
             _raise_if_cancelled(cancel_event)
             actual = _capture_invariants(candidate)
             _raise_if_cancelled(cancel_event)
@@ -500,7 +524,6 @@ def optimize_pdf(
     representation is not smaller, that candidate is discarded and the output
     is an exact byte-for-byte copy of the original.
 
-    Signed documents are returned with ``SIGNED_SKIPPED`` because rewriting a
     Minimum is strictly lossless. Medium and Strong re-encode only qualifying
     raster images in image-heavy/mixed PDFs, leaving text/vector-only PDFs on
     the lossless path. Signed documents are skipped because any rewrite would
@@ -526,12 +549,16 @@ def optimize_pdf(
         raise InputPDFError(f"Could not read '{source}'.") from exc
 
     if cancel_event is not None and cancel_event.is_set():
-        return _cancelled_result(source, input_size, 0, started_at, progress_callback)
+        return _cancelled_result(
+            source, input_size, 0, started_at, progress_callback,
+            selected_options.compression_level,
+        )
 
     _emit(progress_callback, OptimizationStage.CHECKING)
     if cancel_event is not None and cancel_event.is_set():
         return _cancelled_result(
-            source, input_size, 0, started_at, progress_callback
+            source, input_size, 0, started_at, progress_callback,
+            selected_options.compression_level,
         )
 
     pdf = _open_input(source)
@@ -548,7 +575,7 @@ def optimize_pdf(
         )
         _raise_if_cancelled(cancel_event)
 
-        if _has_digital_signature(pdf):
+        if _has_digital_signature(pdf, cancel_event):
             error = SignedPDFError(
                 f"'{source.name}' is digitally signed; optimization was skipped "
                 "to keep the signature valid."
@@ -719,7 +746,8 @@ def optimize_pdf(
         return result
     except _CancellationRequested:
         return _cancelled_result(
-            source, input_size, page_count, started_at, progress_callback
+            source, input_size, page_count, started_at, progress_callback,
+            selected_options.compression_level,
         )
     except pikepdf.PasswordError as exc:
         raise EncryptedPDFError(

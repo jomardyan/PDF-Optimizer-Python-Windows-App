@@ -16,6 +16,7 @@ htmlcov/
 
 # Virtual environments
 .venv/
+.venv-*/
 venv/
 env/
 ENV/
@@ -46,4 +47,5 @@ Desktop.ini
 *.log
 *.tmp
 *.bak
+artifacts/
 ~$*

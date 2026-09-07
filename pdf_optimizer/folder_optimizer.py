@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import tempfile
 import time
 from collections.abc import Callable, Iterator
@@ -19,6 +20,7 @@ from .optimizer import (
     OptimizationStage,
     OptimizationStatus,
     OutputWriteError,
+    _validate_suffix,
     optimize_pdf,
 )
 from .smart_images import CompressionLevel
@@ -77,6 +79,7 @@ def next_available_clone_path(
     output_parent: str | os.PathLike[str] | None = None,
     suffix: str = "_optimized",
 ) -> Path:
+    _validate_suffix(suffix)
     source = _absolute_path(source_dir)
     parent = _absolute_path(output_parent) if output_parent is not None else source.parent
     base_name = f"{source.name}{suffix}"
@@ -121,6 +124,16 @@ def _walk_tree(source: Path) -> Iterator[tuple[Path, list[str], list[str]]]:
         followlinks=False,
         onerror=raise_walk_error,
     ):
+        # os.walk(followlinks=False) can still follow Windows junctions.
+        for name in directories:
+            entry = Path(root) / name
+            if getattr(entry.lstat(), "st_reparse_tag", None) == getattr(
+                stat, "IO_REPARSE_TAG_MOUNT_POINT", -1
+            ):
+                raise OutputWriteError(
+                    f"Cannot safely clone the directory junction '{entry}'. "
+                    "Select its target folder directly instead."
+                )
         yield Path(root), directories, files
 
 
@@ -129,8 +142,10 @@ def _copy_file(
     destination: Path,
     cancel_event: CancellationEvent | None,
 ) -> None:
+    created = False
     try:
         with source.open("rb") as source_stream, destination.open("xb") as output_stream:
+            created = True
             while True:
                 _raise_if_cancelled(cancel_event)
                 chunk = source_stream.read(1024 * 1024)
@@ -139,10 +154,15 @@ def _copy_file(
                 output_stream.write(chunk)
         shutil.copystat(source, destination, follow_symlinks=False)
     except _FolderCancelled:
-        destination.unlink(missing_ok=True)
+        if created:
+            destination.unlink(missing_ok=True)
         raise
     except OSError as exc:
-        destination.unlink(missing_ok=True)
+        if created:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
         raise OutputWriteError(f"Could not copy '{source}'.") from exc
 
 
@@ -167,7 +187,37 @@ def _safe_remove_temp_tree(path: Path | None, expected_parent: Path) -> None:
         return
     if resolved_parent != expected or ".pdf_optimizer_clone_" not in path.name:
         return
-    shutil.rmtree(path, ignore_errors=True)
+    def remove_readonly(function: Callable, filename: str, _error: object) -> None:
+        # copystat can make staged files read-only on Windows.
+        try:
+            os.chmod(filename, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+            function(filename)
+        except OSError:
+            pass
+
+    shutil.rmtree(path, onerror=remove_readonly)
+
+
+def _publish_clone(temporary_root: Path, source: Path, parent: Path) -> Path:
+    """Publish without overwriting existing clones, including concurrent jobs."""
+    while True:
+        final_root = next_available_clone_path(source, parent)
+        reserved = False
+        try:
+            if os.name != "nt":
+                # POSIX rename replaces empty directories. Reserve our own first.
+                final_root.mkdir()
+                reserved = True
+            os.rename(temporary_root, final_root)
+            return final_root
+        except OSError as exc:
+            if reserved:
+                final_root.rmdir()
+            elif os.path.lexists(final_root):
+                continue
+            raise OutputWriteError(
+                f"Could not finalize the cloned folder '{final_root}'."
+            ) from exc
 
 
 def _cancelled_result(
@@ -225,27 +275,31 @@ def clone_and_optimize_folder(
 
     if not source.exists() or not source.is_dir():
         raise OutputWriteError(f"The selected folder does not exist: '{source}'.")
+    if _is_relative_to(parent.resolve(strict=False), source.resolve(strict=False)):
+        raise OutputWriteError(
+            "Choose an output location outside the source folder to avoid recursive cloning."
+        )
+    if cancel_event is not None and cancel_event.is_set():
+        return _cancelled_result(source, started_at, selected_options, progress_callback)
     try:
         parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise OutputWriteError(f"Could not create the output folder '{parent}'.") from exc
     if not parent.is_dir():
         raise OutputWriteError(f"The output location is not a folder: '{parent}'.")
-    if _is_relative_to(parent.resolve(strict=False), source.resolve(strict=False)):
-        raise OutputWriteError(
-            "Choose an output location outside the source folder to avoid recursive cloning."
-        )
-
-    if cancel_event is not None and cancel_event.is_set():
-        return _cancelled_result(source, started_at, selected_options, progress_callback)
-
-    _emit(progress_callback, FolderProgress(FolderStage.SCANNING, None, 0, 0))
     try:
-        walk_snapshot = list(_walk_tree(source))
+        _emit(progress_callback, FolderProgress(FolderStage.SCANNING, None, 0, 0))
+        _raise_if_cancelled(cancel_event)
+        walk_snapshot = []
+        for entry in _walk_tree(source):
+            _raise_if_cancelled(cancel_event)
+            walk_snapshot.append(entry)
+        _raise_if_cancelled(cancel_event)
+    except _FolderCancelled:
+        return _cancelled_result(source, started_at, selected_options, progress_callback)
     except OSError as exc:
         raise OutputWriteError(f"Could not read every item in '{source}'.") from exc
     total_files = sum(len(files) for _, _, files in walk_snapshot)
-    _raise_if_cancelled(cancel_event)
 
     try:
         temporary_root = Path(
@@ -378,11 +432,8 @@ def clone_and_optimize_folder(
             progress_callback,
             FolderProgress(FolderStage.FINALIZING, None, completed_files, total_files),
         )
-        final_root = next_available_clone_path(source, parent)
-        try:
-            os.rename(temporary_root, final_root)
-        except OSError as exc:
-            raise OutputWriteError(f"Could not finalize the cloned folder '{final_root}'.") from exc
+        _raise_if_cancelled(cancel_event)
+        final_root = _publish_clone(temporary_root, source, parent)
         temporary_root = None
 
         saved_bytes = max(0, input_pdf_bytes - output_pdf_bytes)
@@ -427,6 +478,8 @@ def clone_and_optimize_folder(
             progress_callback,
             total_files,
         )
+    except OSError as exc:
+        raise OutputWriteError(f"Could not complete the clone of '{source}'.") from exc
     finally:
         _safe_remove_temp_tree(temporary_root, parent)
 
