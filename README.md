@@ -6,11 +6,11 @@ PDF Optimizer is a Windows desktop app for content-aware PDF compression and com
 
 | Level | Automatic behavior | Quality tradeoff |
 | --- | --- | --- |
-| **Minimum** | Structural/object-stream and lossless Flate compression only | Strictly lossless; images and vectors are not re-encoded |
-| **Medium** | Keeps text/vector PDFs on the lossless path; recompresses sufficiently large images in mixed/scanned PDFs at high quality | Recommended for everyday use; differences should be difficult to notice at normal viewing size |
-| **Strong** | Uses the same content detection with stronger JPEG compression and a smaller maximum raster dimension | Produces smaller scans; softness or JPEG artifacts may be visible when zoomed |
+| **Minimum** | Merges page content streams, shortens redundant digits, and recompresses Flate data at the maximum level; object streams | Strictly lossless; pages render pixel-for-pixel identically and images are not re-encoded |
+| **Medium** | Everything in Minimum, plus coordinates in vector drawings trimmed to 3 decimals and high-quality JPEG recompression of large images in mixed/scanned PDFs (colour scans with no real colour are stored as grayscale) | Recommended for everyday use; differences should be difficult to notice at normal viewing size |
+| **Strong** | Everything in Medium, plus vector coordinates trimmed to 2 decimals and scans reduced to about 130 dpi at the printed page size with stronger JPEG compression | Roughly halves typical scanned and print-to-PDF documents; softness may be visible when zoomed |
 
-Text, fonts, vectors, links, forms, annotations, and page structure are never rasterized. Medium and Strong only target qualifying RGB or grayscale raster images. Transparent, masked, monochrome, small, and unusual color-space images are conservatively skipped.
+Text, fonts, vectors, links, forms, annotations, and page structure are never rasterized. Medium and Strong only target qualifying RGB, ICC-based, or grayscale raster images. Transparent, masked, monochrome, small, and unusual color-space images are conservatively skipped. Page content that contains text strings, inline images, or comments is never rewritten; only pure vector drawing data (for example text converted to outlines by a browser's print-to-PDF) is shortened.
 
 Size reduction is not guaranteed. If a candidate is not smaller, the app discards it, creates an exact byte-for-byte copy under the output name, and reports **Already optimal**.
 
@@ -21,7 +21,8 @@ Use **Add folder** to create a complete sibling clone named `<folder>_optimized`
 - Recreates every subfolder, including empty folders.
 - Copies Word, Excel, images, archives, and every other non-PDF file without changing their names or contents.
 - Optimizes each PDF into its original relative location and original filename inside the clone.
-- Copies signed, encrypted, or malformed PDFs unchanged so the cloned folder is still complete.
+- Keeps each optimized PDF's modified time, and copies signed, encrypted, malformed, or otherwise unprocessable PDFs unchanged so the cloned folder is still complete.
+- Optimizes up to four PDFs at once in separate worker processes (about 3x faster on image-heavy folders). If a worker crashes on a damaged PDF, only that file is copied unchanged.
 - Builds the clone in a temporary directory and publishes it only after the full tree is ready; canceled work leaves no partial clone.
 
 Existing clone names are never overwritten; `_optimized_1`, `_optimized_2`, and so on are used when necessary. Windows directory junctions are rejected to prevent loops or copying data outside the selected tree; select the junction's target folder directly. Symbolic links are preserved when Windows permissions allow it.

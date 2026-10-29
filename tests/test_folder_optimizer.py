@@ -224,3 +224,180 @@ def test_clone_rejects_junction_before_traversal(tmp_path: Path) -> None:
     finally:
         # Remove the link itself, never its target.
         junction.rmdir()
+
+
+def _snapshot(base: Path) -> dict[str, int | None]:
+    """Every directory (None) and file (size) below base, as relative paths."""
+    entries: dict[str, int | None] = {}
+    for path in base.rglob("*"):
+        entries[path.relative_to(base).as_posix()] = (
+            path.stat().st_size if path.is_file() else None
+        )
+    return entries
+
+
+@pytest.mark.parametrize("level", list(CompressionLevel))
+def test_clone_mirrors_every_entry_of_a_messy_tree(tmp_path: Path, level) -> None:
+    source = tmp_path / "Dépôt ✓"
+    (source / "a" / "b" / "empty").mkdir(parents=True)
+    (source / "dir.pdf").mkdir()
+    for pdf in (
+        source / "top.pdf",
+        source / "UPPER.PDF",
+        source / "Mixed.PdF",
+        source / "a" / "ünï ✓.pdf",
+        source / "dir.pdf" / "inside.pdf",
+    ):
+        _write_reducible_pdf(pdf)
+    (source / "zero.pdf").write_bytes(b"")
+    (source / "garbage.pdf").write_bytes(b"not a pdf")
+    (source / "fake.pdf").write_bytes(b"PK\x03\x04zip")
+    _write_encrypted_pdf(source / "enc.pdf")
+    (source / "noext").write_bytes(b"x" * 10)
+    (source / "x.pdf.bak").write_bytes(b"bak")
+    (source / ".hidden").write_bytes(b"h")
+    (source / "a" / "b" / "data.csv").write_text("a,b\n1,2\n")
+    (source / "zero.txt").write_bytes(b"")
+    expected = _snapshot(source)
+    unchanged = {
+        name for name, size in expected.items() if size is not None and not name.lower().endswith(".pdf")
+    }
+    contents = {name: (source / name).read_bytes() for name in unchanged}
+
+    result = clone_and_optimize_folder(
+        source, tmp_path / "out", OptimizationOptions(compression_level=level)
+    )
+
+    clone = result.output_path
+    assert clone is not None
+    actual = _snapshot(clone)
+    assert set(actual) == set(expected)
+    for name in unchanged:
+        assert (clone / name).read_bytes() == contents[name]
+    assert result.pdf_total == 9
+    assert result.copied_pdf_count == 4  # zero, garbage, fake, encrypted
+    assert result.other_files_copied == len(unchanged)
+    assert actual["top.pdf"] < expected["top.pdf"]
+    assert actual["UPPER.PDF"] < expected["UPPER.PDF"]
+    assert [p.name for p in (tmp_path / "out").iterdir()] == [clone.name]
+    assert _snapshot(source) == expected
+
+
+def test_unexpected_pdf_engine_error_falls_back_to_exact_copy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "Source"
+    source.mkdir()
+    _write_reducible_pdf(source / "boom.pdf")
+    _write_reducible_pdf(source / "fine.pdf")
+    (source / "note.txt").write_text("keep")
+    original = folder_module.optimize_pdf
+
+    def flaky(path, *args, **kwargs):
+        if Path(path).name == "boom.pdf":
+            raise TypeError("unexpected library failure")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(folder_module, "optimize_pdf", flaky)
+    # Inline mode: a monkeypatch does not reach worker processes.
+    result = clone_and_optimize_folder(source, max_workers=1)
+
+    clone = result.output_path
+    assert (clone / "boom.pdf").read_bytes() == (source / "boom.pdf").read_bytes()
+    assert (clone / "fine.pdf").stat().st_size < (source / "fine.pdf").stat().st_size
+    assert (clone / "note.txt").read_text() == "keep"
+    assert result.copied_pdf_count == 1
+    assert result.optimized_count == 1
+
+
+def test_optimized_pdf_keeps_source_modified_time(tmp_path: Path) -> None:
+    import os
+
+    source = tmp_path / "Source"
+    source.mkdir()
+    _write_reducible_pdf(source / "report.pdf")
+    os.utime(source / "report.pdf", (1_500_000_000, 1_500_000_000))
+
+    result = clone_and_optimize_folder(source)
+
+    assert (result.output_path / "report.pdf").stat().st_mtime == pytest.approx(1_500_000_000, abs=2)
+
+
+def _make_parallel_tree(source: Path, count: int = 9) -> None:
+    for index in range(count):
+        _write_reducible_pdf(source / f"folder{index % 3}" / f"doc{index}.pdf")
+    (source / "folder0" / "notes.txt").write_text("keep")
+    (source / "empty").mkdir()
+    (source / "garbage.pdf").write_bytes(b"not a pdf")
+
+
+def test_parallel_workers_match_single_worker_output(tmp_path: Path) -> None:
+    source = tmp_path / "Source"
+    _make_parallel_tree(source)
+
+    serial = clone_and_optimize_folder(source, tmp_path / "serial", max_workers=1)
+    parallel = clone_and_optimize_folder(source, tmp_path / "parallel", max_workers=3)
+
+    assert _snapshot(parallel.output_path) == _snapshot(serial.output_path)
+    for field in (
+        "pdf_total", "optimized_count", "already_optimal_count",
+        "copied_pdf_count", "other_files_copied", "page_count",
+        "input_size", "output_size",
+    ):
+        assert getattr(parallel, field) == getattr(serial, field), field
+    assert parallel.pdf_total == 10
+    assert parallel.copied_pdf_count == 1
+    assert [p.name for p in (tmp_path / "parallel").iterdir()] == [parallel.output_path.name]
+
+
+def test_parallel_cancel_leaves_no_clone_or_stray_processes(tmp_path: Path) -> None:
+    source = tmp_path / "Source"
+    _make_parallel_tree(source, count=12)
+    cancel = threading.Event()
+
+    def cancel_after_first_pdf(progress) -> None:
+        if progress.stage is FolderStage.OPTIMIZING_PDF:
+            cancel.set()
+
+    result = clone_and_optimize_folder(
+        source, tmp_path / "out", cancel_event=cancel,
+        progress_callback=cancel_after_first_pdf, max_workers=3,
+    )
+
+    assert result.status is OptimizationStatus.CANCELLED
+    assert not list((tmp_path / "out").iterdir())
+
+
+def test_max_workers_must_be_positive(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        clone_and_optimize_folder(tmp_path, max_workers=0)
+
+
+def crash_on_poison(task):
+    """Importable by spawned workers: simulates a native crash on one PDF."""
+    import os
+
+    if task.source_file.name == "poison.pdf":
+        os._exit(1)
+    return folder_module._process_pdf(task, None, None)
+
+
+def test_worker_crash_is_isolated_and_pdf_copied_unchanged(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "Source"
+    _make_parallel_tree(source)
+    _write_reducible_pdf(source / "folder1" / "poison.pdf")
+    monkeypatch.setattr(folder_module, "_process_pdf_in_worker", crash_on_poison)
+
+    result = clone_and_optimize_folder(source, tmp_path / "out", max_workers=3)
+
+    clone = result.output_path
+    assert (clone / "folder1" / "poison.pdf").read_bytes() == (
+        source / "folder1" / "poison.pdf"
+    ).read_bytes()
+    # Innocent PDFs lost with the dead pool were retried and still optimized.
+    assert result.copied_pdf_count == 2  # garbage.pdf and poison.pdf
+    assert result.optimized_count == 9
+    assert set(_snapshot(clone)) == set(_snapshot(source))
+    assert not list(clone.rglob(".pdf_optimizer_*"))

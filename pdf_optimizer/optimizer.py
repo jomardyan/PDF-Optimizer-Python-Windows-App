@@ -18,6 +18,7 @@ from typing import Protocol, TypeAlias
 
 import pikepdf
 
+from .content_streams import optimize_content_streams
 from .smart_images import (
     CompressionLevel,
     DocumentType,
@@ -621,6 +622,13 @@ def optimize_pdf(
             lambda: _raise_if_cancelled(cancel_event),
         )
         _raise_if_cancelled(cancel_event)
+        optimize_content_streams(
+            pdf,
+            selected_options.compression_level,
+            selected_options.recompress_flate,
+            lambda: _raise_if_cancelled(cancel_event),
+        )
+        _raise_if_cancelled(cancel_event)
 
         object_stream_mode = (
             pikepdf.ObjectStreamMode.generate
@@ -643,7 +651,9 @@ def optimize_pdf(
                 linearize=selected_options.linearize,
                 progress=save_progress,
                 encryption=False,
-                recompress_flate=selected_options.recompress_flate,
+                # Flate streams were already recompressed at zlib level 9 above;
+                # qpdf's own pass would redo them at a weaker level.
+                recompress_flate=False,
             )
         except _CancellationRequested:
             raise

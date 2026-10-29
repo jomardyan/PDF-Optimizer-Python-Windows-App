@@ -157,3 +157,49 @@ def test_cyclic_form_resources_do_not_recurse_forever() -> None:
         form["/Resources"] = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Self=form))
         page.obj["/Resources"] = form["/Resources"]
         assert analyze_document(pdf).image_count == 0
+
+
+def _write_tinted_a4_scan(path: Path, icc: bool) -> None:
+    # A4 page (595 x 842 pt) holding a 200 dpi near-grayscale RGB scan.
+    gray = Image.effect_noise((1654, 2338), 40).convert("L")
+    tinted = Image.merge("RGB", (gray, gray.point(lambda v: min(255, v + 3)), gray))
+    with pikepdf.Pdf.new() as pdf:
+        page = pdf.add_blank_page(page_size=(595, 842))
+        stream = pdf.make_stream(tinted.tobytes())
+        stream["/Type"] = pikepdf.Name.XObject
+        stream["/Subtype"] = pikepdf.Name.Image
+        stream["/Width"] = 1654
+        stream["/Height"] = 2338
+        stream["/BitsPerComponent"] = 8
+        if icc:
+            from PIL import ImageCms
+
+            icc_stream = pdf.make_stream(ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes())
+            icc_stream["/N"] = 3
+            stream["/ColorSpace"] = pikepdf.Array([pikepdf.Name.ICCBased, icc_stream])
+        else:
+            stream["/ColorSpace"] = pikepdf.Name.DeviceRGB
+        page.obj["/Resources"] = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary({"/Scan": stream})
+        )
+        page.obj["/Contents"] = pdf.make_stream(b"q 595 0 0 842 0 0 cm /Scan Do Q")
+        pdf.save(path)
+
+
+@pytest.mark.parametrize("icc", [False, True])
+def test_strong_scales_scans_to_page_dpi_and_drops_paper_tint(tmp_path: Path, icc: bool) -> None:
+    source = tmp_path / "scan.pdf"
+    _write_tinted_a4_scan(source, icc)
+
+    result = optimize_pdf(
+        source, tmp_path / "out", OptimizationOptions(compression_level=CompressionLevel.STRONG)
+    )
+
+    assert result.status is OptimizationStatus.OPTIMIZED
+    assert result.images_optimized == 1
+    assert result.saved_percent > 50
+    with pikepdf.Pdf.open(result.output_path) as pdf:
+        image = next(iter(pdf.pages[0].images.values()))  # noqa: deprecation is harmless here
+        # 130 dpi on an 11.7 inch page is about 1520 px on the long side.
+        assert max(image.Width, image.Height) <= 1530
+        assert str(image.ColorSpace) == "/DeviceGray"

@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import shutil
 import stat
 import tempfile
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 from .optimizer import (
     CancellationEvent,
-    OptimizationError,
     OptimizationOptions,
     OptimizationResult,
     OptimizationStage,
@@ -166,6 +169,14 @@ def _copy_file(
         raise OutputWriteError(f"Could not copy '{source}'.") from exc
 
 
+def _preserve_file_metadata(source: Path, destination: Path) -> None:
+    """Carry timestamps over to a rewritten PDF; failure must not fail the clone."""
+    try:
+        shutil.copystat(source, destination, follow_symlinks=False)
+    except OSError:
+        pass
+
+
 def _copy_symlink(source: Path, destination: Path) -> None:
     try:
         os.symlink(
@@ -252,12 +263,192 @@ def _cancelled_result(
     )
 
 
+DEFAULT_MAX_WORKERS = 4
+_POLL_SECONDS = 0.1
+_TEMP_PDF_PATTERN = ".pdf_optimizer_*.pdf"
+
+
+def default_worker_count() -> int:
+    """A few PDFs at once: enough to use several cores, light on memory."""
+    return max(1, min(DEFAULT_MAX_WORKERS, os.cpu_count() or 1))
+
+
+@dataclass(frozen=True, slots=True)
+class _PdfTask:
+    source_file: Path
+    destination_file: Path
+    relative_file: Path
+    options: OptimizationOptions
+
+
+@dataclass(frozen=True, slots=True)
+class _PdfOutcome:
+    """What happened to one PDF; ``result`` is None when it was copied unchanged."""
+
+    result: OptimizationResult | None
+    output_size: int
+
+
+def _process_pdf(
+    task: _PdfTask,
+    cancel_event: CancellationEvent | None,
+    progress_callback: Callable[[OptimizationStage], None] | None,
+) -> _PdfOutcome:
+    """Optimize one PDF into the clone, or copy it unchanged if that is not possible."""
+    try:
+        result: OptimizationResult | None = optimize_pdf(
+            task.source_file,
+            output_dir=task.destination_file.parent,
+            options=replace(task.options, suffix=""),
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        )
+    except Exception:  # noqa: BLE001 - one bad PDF must not abort the clone
+        # Expected failures (encrypted, malformed, failed validation) and
+        # unexpected library errors alike fall back to an exact copy.
+        result = None
+    if result is not None:
+        if result.status is OptimizationStatus.CANCELLED:
+            raise _FolderCancelled
+        if result.output_path is not None:
+            if result.output_path != task.destination_file:
+                raise OutputWriteError(
+                    f"Could not preserve the PDF filename '{task.relative_file}'."
+                )
+            _preserve_file_metadata(task.source_file, task.destination_file)
+            return _PdfOutcome(result, result.output_size)
+    _copy_file(task.source_file, task.destination_file, cancel_event)
+    return _PdfOutcome(None, task.destination_file.stat().st_size)
+
+
+# Worker-process side -------------------------------------------------------
+
+_worker_cancel_event: Any = None
+
+
+def _init_worker(cancel_event: Any) -> None:
+    global _worker_cancel_event
+    _worker_cancel_event = cancel_event
+
+
+class _WorkerCancel:
+    def is_set(self) -> bool:
+        return _worker_cancel_event is not None and _worker_cancel_event.is_set()
+
+
+def _process_pdf_in_worker(task: _PdfTask) -> _PdfOutcome:
+    return _process_pdf(task, _WorkerCancel(), None)
+
+
+# Main-process side ---------------------------------------------------------
+
+
+class _PdfWorkers:
+    """A few spawned processes optimizing PDFs, tolerant of worker crashes.
+
+    Processes (not threads) are used because qpdf validation and PDF parsing
+    hold the GIL, so threads gave no speed-up.
+    """
+
+    def __init__(self, size: int, cancel_event: CancellationEvent | None) -> None:
+        self._context = multiprocessing.get_context("spawn")
+        self._size = size
+        self._cancel_event = cancel_event
+        self._stop = self._context.Event()
+        self._executor: ProcessPoolExecutor | None = None
+        self._pending: dict[Future[_PdfOutcome], _PdfTask] = {}
+
+    @property
+    def has_free_slot(self) -> bool:
+        return len(self._pending) < self._size
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self._pending)
+
+    def _new_executor(self, size: int) -> ProcessPoolExecutor:
+        return ProcessPoolExecutor(
+            max_workers=size,
+            mp_context=self._context,
+            initializer=_init_worker,
+            initargs=(self._stop,),
+        )
+
+    def submit(self, task: _PdfTask) -> None:
+        for attempt in range(2):
+            if self._executor is None:
+                self._executor = self._new_executor(self._size)
+            try:
+                future = self._executor.submit(_process_pdf_in_worker, task)
+            except BrokenProcessPool:
+                self._discard_executor()
+                if attempt:
+                    raise OutputWriteError("The PDF worker processes could not be started.")
+            else:
+                self._pending[future] = task
+                return
+
+    def collect(self) -> list[_PdfOutcome]:
+        """Wait briefly for finished PDFs; raises a worker's fatal error."""
+        done, _ = wait(self._pending, timeout=_POLL_SECONDS, return_when=FIRST_COMPLETED)
+        outcomes: list[_PdfOutcome] = []
+        lost: list[_PdfTask] = []
+        for future in done:
+            task = self._pending.pop(future)
+            try:
+                outcomes.append(future.result())
+            except BrokenProcessPool:
+                lost.append(task)
+        if lost:
+            # The pool is unusable and every other in-flight task is lost with
+            # it, so settle them all before anything new is submitted.
+            for future, task in list(self._pending.items()):
+                del self._pending[future]
+                try:
+                    outcomes.append(future.result())
+                except BrokenProcessPool:
+                    lost.append(task)
+            self._discard_executor()
+            for task in lost:
+                outcomes.append(self._recover(task))
+        return outcomes
+
+    def _discard_executor(self) -> None:
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    def _recover(self, task: _PdfTask) -> _PdfOutcome:
+        """Retry a lost PDF alone; if it kills its worker again, copy it unchanged."""
+        directory = task.destination_file.parent
+        # A killed worker can leave its reserved output or a temp file behind.
+        task.destination_file.unlink(missing_ok=True)
+        for leftover in directory.glob(_TEMP_PDF_PATTERN):
+            leftover.unlink(missing_ok=True)
+        with self._new_executor(1) as isolated:
+            try:
+                return isolated.submit(_process_pdf_in_worker, task).result()
+            except BrokenProcessPool:
+                pass
+        task.destination_file.unlink(missing_ok=True)
+        for leftover in directory.glob(_TEMP_PDF_PATTERN):
+            leftover.unlink(missing_ok=True)
+        _copy_file(task.source_file, task.destination_file, self._cancel_event)
+        return _PdfOutcome(None, task.destination_file.stat().st_size)
+
+    def close(self) -> None:
+        """Stop in-flight work and wait for it so the staged tree can be removed."""
+        self._stop.set()
+        self._discard_executor()
+
+
 def clone_and_optimize_folder(
     source_dir: str | os.PathLike[str],
     output_parent: str | os.PathLike[str] | None = None,
     options: OptimizationOptions | None = None,
     cancel_event: CancellationEvent | None = None,
     progress_callback: FolderProgressCallback | None = None,
+    max_workers: int | None = None,
 ) -> FolderOptimizationResult:
     """Clone a full tree and replace each PDF in the clone with an optimized one.
 
@@ -265,8 +456,11 @@ def clone_and_optimize_folder(
     rewritten safely (for example signed, encrypted, or malformed documents)
     are copied byte-for-byte so the clone remains complete. Work is staged in
     a temporary sibling directory and published only when the whole clone is
-    ready.
+    ready. Up to ``max_workers`` PDFs (default: a few) are optimized at once in
+    separate processes; ``max_workers=1`` processes them one at a time.
     """
+    if max_workers is not None and max_workers < 1:
+        raise ValueError("max_workers must be at least 1.")
     started_at = time.perf_counter()
     source = _absolute_path(source_dir)
     selected_options = options or OptimizationOptions()
@@ -322,6 +516,40 @@ def clone_and_optimize_folder(
     images_optimized = 0
     completed_files = 0
 
+    pdf_candidates = sum(
+        1
+        for root, _, files in walk_snapshot
+        for filename in files
+        if filename.lower().endswith(".pdf") and not (root / filename).is_symlink()
+    )
+    worker_count = min(max_workers or default_worker_count(), pdf_candidates)
+    # A single worker (or a single PDF) is processed inline: no process start-up.
+    workers = _PdfWorkers(worker_count, cancel_event) if worker_count > 1 else None
+
+    def record(outcome: _PdfOutcome) -> None:
+        nonlocal optimized_count, already_optimal_count, copied_pdf_count
+        nonlocal output_pdf_bytes, total_pages, images_optimized, completed_files
+        output_pdf_bytes += outcome.output_size
+        result = outcome.result
+        if result is None:
+            copied_pdf_count += 1
+        else:
+            total_pages += result.page_count
+            images_optimized += result.images_optimized
+            if result.status is OptimizationStatus.OPTIMIZED:
+                optimized_count += 1
+            else:
+                already_optimal_count += 1
+        completed_files += 1
+
+    def drain(until_free_slot: bool) -> None:
+        while workers is not None and workers.has_pending:
+            if until_free_slot and workers.has_free_slot:
+                return
+            for outcome in workers.collect():
+                record(outcome)
+            _raise_if_cancelled(cancel_event)
+
     try:
         for root, directories, files in walk_snapshot:
             _raise_if_cancelled(cancel_event)
@@ -343,81 +571,61 @@ def clone_and_optimize_folder(
                 source_file = root / filename
                 destination_file = destination_root / filename
                 relative_file = source_file.relative_to(source)
-                if source_file.is_symlink():
-                    stage = FolderStage.COPYING
-                    _emit(
-                        progress_callback,
-                        FolderProgress(stage, relative_file, completed_files, total_files),
-                    )
-                    _copy_symlink(source_file, destination_file)
-                    other_files_copied += 1
-                elif source_file.suffix.lower() == ".pdf":
+                if source_file.suffix.lower() == ".pdf" and not source_file.is_symlink():
                     pdf_total += 1
                     try:
                         input_pdf_bytes += source_file.stat().st_size
                     except OSError as exc:
                         raise OutputWriteError(f"Could not inspect '{source_file}'.") from exc
+                    task = _PdfTask(source_file, destination_file, relative_file, selected_options)
 
-                    def report_pdf_stage(
-                        stage: OptimizationStage,
-                        current_file: Path = relative_file,
-                        completed: int = completed_files,
-                    ) -> None:
+                    if workers is None:
+
+                        def report_pdf_stage(
+                            stage: OptimizationStage,
+                            current_file: Path = relative_file,
+                        ) -> None:
+                            _emit(
+                                progress_callback,
+                                FolderProgress(
+                                    FolderStage.OPTIMIZING_PDF,
+                                    current_file,
+                                    completed_files,
+                                    total_files,
+                                    stage,
+                                ),
+                            )
+
+                        record(_process_pdf(task, cancel_event, report_pdf_stage))
+                    else:
+                        # Wait for a free worker slot; this also bounds memory use.
+                        drain(until_free_slot=True)
                         _emit(
                             progress_callback,
                             FolderProgress(
                                 FolderStage.OPTIMIZING_PDF,
-                                current_file,
-                                completed,
+                                relative_file,
+                                completed_files,
                                 total_files,
-                                stage,
                             ),
                         )
+                        workers.submit(task)
+                    continue
 
-                    try:
-                        pdf_result: OptimizationResult = optimize_pdf(
-                            source_file,
-                            output_dir=destination_root,
-                            options=replace(selected_options, suffix=""),
-                            cancel_event=cancel_event,
-                            progress_callback=report_pdf_stage,
-                        )
-                    except OptimizationError:
-                        _copy_file(source_file, destination_file, cancel_event)
-                        copied_pdf_count += 1
-                        output_pdf_bytes += destination_file.stat().st_size
-                    else:
-                        if pdf_result.status is OptimizationStatus.CANCELLED:
-                            raise _FolderCancelled
-                        if pdf_result.output_path is None:
-                            _copy_file(source_file, destination_file, cancel_event)
-                            copied_pdf_count += 1
-                            output_pdf_bytes += destination_file.stat().st_size
-                        else:
-                            if pdf_result.output_path != destination_file:
-                                raise OutputWriteError(
-                                    f"Could not preserve the PDF filename '{relative_file}'."
-                                )
-                            output_pdf_bytes += pdf_result.output_size
-                            total_pages += pdf_result.page_count
-                            images_optimized += pdf_result.images_optimized
-                            if pdf_result.status is OptimizationStatus.OPTIMIZED:
-                                optimized_count += 1
-                            else:
-                                already_optimal_count += 1
+                _emit(
+                    progress_callback,
+                    FolderProgress(
+                        FolderStage.COPYING, relative_file, completed_files, total_files
+                    ),
+                )
+                if source_file.is_symlink():
+                    _copy_symlink(source_file, destination_file)
                 else:
-                    _emit(
-                        progress_callback,
-                        FolderProgress(
-                            FolderStage.COPYING,
-                            relative_file,
-                            completed_files,
-                            total_files,
-                        ),
-                    )
                     _copy_file(source_file, destination_file, cancel_event)
-                    other_files_copied += 1
+                other_files_copied += 1
                 completed_files += 1
+
+        drain(until_free_slot=False)
 
         # Restore directory timestamps/permissions after writing their contents.
         for root, _, _ in reversed(walk_snapshot):
@@ -481,6 +689,9 @@ def clone_and_optimize_folder(
     except OSError as exc:
         raise OutputWriteError(f"Could not complete the clone of '{source}'.") from exc
     finally:
+        if workers is not None:
+            # Workers write inside the staged tree: stop them before cleanup.
+            workers.close()
         _safe_remove_temp_tree(temporary_root, parent)
 
 
@@ -490,5 +701,6 @@ __all__ = [
     "FolderProgressCallback",
     "FolderStage",
     "clone_and_optimize_folder",
+    "default_worker_count",
     "next_available_clone_path",
 ]

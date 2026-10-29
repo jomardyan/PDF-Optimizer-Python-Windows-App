@@ -9,7 +9,7 @@ from io import BytesIO
 from typing import Any
 
 import pikepdf
-from PIL import Image
+from PIL import Image, ImageChops
 
 
 class CompressionLevel(str, Enum):
@@ -56,6 +56,15 @@ class _ImagePreset:
     max_dimension: int
     minimum_pixels: int
     subsampling: int
+    # Resolution cap relative to the printed page size (None = pixel cap only).
+    target_dpi: int | None = None
+
+
+# Never shrink an image below this many pixels on its longest side.
+_MINIMUM_TARGET_DIMENSION = 600
+# Colour scans whose chroma is only paper tint/noise are stored as grayscale.
+_GRAY_CHROMA_TOLERANCE = 14
+_GRAY_OUTLIER_FRACTION = 0.001
 
 
 _PRESETS = {
@@ -66,10 +75,11 @@ _PRESETS = {
         subsampling=1,
     ),
     CompressionLevel.STRONG: _ImagePreset(
-        jpeg_quality=76,
+        jpeg_quality=68,
         max_dimension=1800,
         minimum_pixels=300_000,
         subsampling=2,
+        target_dpi=130,
     ),
 }
 
@@ -233,11 +243,72 @@ def analyze_document(
 
 
 def _unique_images(pdf: pikepdf.Pdf) -> tuple[Any, ...]:
+    return tuple(image for image, _ in _unique_images_with_extent(pdf))
+
+
+def _page_longest_inches(page: pikepdf.Page) -> float:
+    try:
+        box = [float(value) for value in page.mediabox]
+        unit = float(page.obj.get("/UserUnit", 1.0))
+        return max(abs(box[2] - box[0]), abs(box[3] - box[1])) * unit / 72.0
+    except (AttributeError, TypeError, ValueError, IndexError, pikepdf.PdfError):
+        return 0.0
+
+
+def _unique_images_with_extent(pdf: pikepdf.Pdf) -> tuple[tuple[Any, float], ...]:
+    """Unique images with the longest page side (inches) they may be shown on.
+
+    The page size is an upper bound for the printed size, so the resolution
+    derived from it can only be underestimated: images are never reduced
+    further than their real on-page resolution allows.
+    """
     images: dict[tuple[str, int, int], Any] = {}
+    extents: dict[tuple[str, int, int], float] = {}
     for page in pdf.pages:
+        longest = _page_longest_inches(page)
         for image in _page_images(page):
-            images.setdefault(_object_identity(image), image)
-    return tuple(images.values())
+            identity = _object_identity(image)
+            images.setdefault(identity, image)
+            extents[identity] = max(extents.get(identity, 0.0), longest)
+    return tuple((images[identity], extents[identity]) for identity in images)
+
+
+def _color_channels(stream: Any) -> tuple[int, bool] | None:
+    """Return (channels, is_icc) for plain or ICC-based gray/RGB images."""
+    color_space = stream.get("/ColorSpace")
+    name = str(color_space)
+    if name == "/DeviceRGB":
+        return 3, False
+    if name == "/DeviceGray":
+        return 1, False
+    try:
+        if isinstance(color_space, pikepdf.Array) and len(color_space) == 2:
+            if str(color_space[0]) == "/ICCBased":
+                channels = int(color_space[1].get("/N"))
+                if channels in (1, 3):
+                    return channels, True
+    except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
+        pass
+    return None
+
+
+def _is_nearly_gray(image: Image.Image) -> bool:
+    """True when an RGB image only has negligible colour (paper tint, noise)."""
+    sample = image.copy()
+    sample.thumbnail((256, 256))
+    try:
+        red, green, blue = sample.split()
+        chroma = ImageChops.lighter(
+            ImageChops.lighter(
+                ImageChops.difference(red, green), ImageChops.difference(green, blue)
+            ),
+            ImageChops.difference(red, blue),
+        )
+        histogram = chroma.histogram()
+        outliers = sum(histogram[_GRAY_CHROMA_TOLERANCE + 1 :])
+        return outliers <= sample.width * sample.height * _GRAY_OUTLIER_FRACTION
+    finally:
+        sample.close()
 
 
 def _delete_key_if_present(stream: Any, key: str) -> None:
@@ -271,7 +342,7 @@ def optimize_raster_images(
     bytes_before = 0
     bytes_after = 0
 
-    for stream in _unique_images(pdf):
+    for stream, page_inches in _unique_images_with_extent(pdf):
         if check_cancelled:
             check_cancelled()
         width, height = _image_dimensions(stream)
@@ -281,7 +352,7 @@ def optimize_raster_images(
             has_mask = "/SMask" in stream or "/Mask" in stream
             is_mask = bool(stream.get("/ImageMask", False))
             has_custom_decode = "/Decode" in stream
-            color_space = str(stream.get("/ColorSpace"))
+            channels_info = _color_channels(stream)
             has_embedded_mask = int(stream.get("/SMaskInData", 0)) != 0
             has_external_data = "/F" in stream
         except (AttributeError, TypeError, ValueError, pikepdf.PdfError):
@@ -298,7 +369,7 @@ def optimize_raster_images(
             or has_custom_decode
             or has_embedded_mask
             or has_external_data
-            or color_space not in {"/DeviceRGB", "/DeviceGray"}
+            or channels_info is None
         ):
             skipped += 1
             continue
@@ -326,8 +397,14 @@ def optimize_raster_images(
                 skipped += 1
                 continue
             longest = max(pil_image.size)
-            if longest > preset.max_dimension:
-                scale = preset.max_dimension / longest
+            limit = preset.max_dimension
+            if preset.target_dpi and page_inches > 0:
+                limit = min(
+                    limit,
+                    max(_MINIMUM_TARGET_DIMENSION, round(page_inches * preset.target_dpi)),
+                )
+            if longest > limit:
+                scale = limit / longest
                 new_size = (
                     max(1, round(pil_image.width * scale)),
                     max(1, round(pil_image.height * scale)),
@@ -335,6 +412,11 @@ def optimize_raster_images(
                 working_image = pil_image.resize(new_size, Image.Resampling.LANCZOS)
             else:
                 working_image = pil_image
+            if working_image.mode == "RGB" and _is_nearly_gray(working_image):
+                grayscale = working_image.convert("L")
+                if working_image is not pil_image:
+                    working_image.close()
+                working_image = grayscale
 
             encoded = BytesIO()
             save_options: dict[str, Any] = {
@@ -345,9 +427,8 @@ def optimize_raster_images(
             }
             if working_image.mode == "RGB":
                 save_options["subsampling"] = preset.subsampling
-            icc_profile = pil_image.info.get("icc_profile")
-            if icc_profile:
-                save_options["icc_profile"] = icc_profile
+            channels, is_icc = channels_info
+            keeps_color_space = is_icc and channels == (3 if working_image.mode == "RGB" else 1)
             working_image.save(encoded, **save_options)
             candidate = encoded.getvalue()
             if len(candidate) >= original_size * 0.97:
@@ -377,9 +458,11 @@ def optimize_raster_images(
         stream["/Width"] = output_width
         stream["/Height"] = output_height
         stream["/BitsPerComponent"] = 8
-        stream["/ColorSpace"] = (
-            pikepdf.Name.DeviceGray if output_mode == "L" else pikepdf.Name.DeviceRGB
-        )
+        if not keeps_color_space:
+            # An ICC profile that still matches the channel count stays untouched.
+            stream["/ColorSpace"] = (
+                pikepdf.Name.DeviceGray if output_mode == "L" else pikepdf.Name.DeviceRGB
+            )
         for key in ("/DecodeParms", "/F", "/FFilter", "/FDecodeParms", "/SMaskInData"):
             _delete_key_if_present(stream, key)
         changed += 1
